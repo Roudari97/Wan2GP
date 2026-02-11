@@ -1,0 +1,21 @@
+{
+    "max_img_h": 1024,
+    "max_img_w": 1024,
+    "max_frames": 1,
+    "in_channels": 16,
+    "out_channels": 16,
+    "patch_spatial": 2,
+    "patch_temporal": 1,
+    "concat_padding_mask": true,
+    "model_channels": 2048,
+    "num_blocks": 28,
+    "num_heads": 32,
+    "mlp_ratio": 4.0,
+    "crossattn_emb_channels": 1024,
+    "pos_emb_cls": "rope3d",
+    "pos_emb_learnable": false,
+    "pos_emb_interpolation": "crop",
+    "rope_h_extrapolation_ratio": 1.0,
+    "rope_w_extrapolation_ratio": 1.0,
+    "rope_t_extrapolation_ratio": 1.0
+}

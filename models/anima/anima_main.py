@@ -54,37 +54,12 @@ class model_factory:
         def preprocess_sd(state_dict):
             return conv_state_dict(state_dict)
 
-        # Default config for Anima 2B
-        config = {
-            "max_img_h": 1024,
-            "max_img_w": 1024,
-            "max_frames": 1,
-            "in_channels": 16,
-            "out_channels": 16,
-            "patch_spatial": 2,
-            "patch_temporal": 1,
-            "concat_padding_mask": True,
-            "model_channels": 2048,
-            "num_blocks": 28,
-            "num_heads": 32,
-            "mlp_ratio": 4.0,
-            "crossattn_emb_channels": 1024,
-            "pos_emb_cls": "rope3d",
-            "pos_emb_learnable": False,
-            "pos_emb_interpolation": "crop",
-            "rope_h_extrapolation_ratio": 1.0,
-            "rope_w_extrapolation_ratio": 1.0,
-            "rope_t_extrapolation_ratio": 1.0,
-        }
+        default_transformer_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", f"{base_model_type}.json")
 
-        # Check for custom config file
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", f"{base_model_type}.json")
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                custom_config = json.load(f)
-            custom_config.pop("_class_name", None)
-            custom_config.pop("_diffusers_version", None)
-            config.update(custom_config)
+        with open(default_transformer_config, "r") as f:
+            config = json.load(f)
+        config.pop("_class_name", None)
+        config.pop("_diffusers_version", None)
 
         kwargs_light = {"writable_tensors": False, "preprocess_sd": preprocess_sd}
 
