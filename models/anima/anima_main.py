@@ -1,17 +1,40 @@
 import json
 import os
 import torch
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
 from accelerate import init_empty_weights
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers import (
+    FlowMatchEulerDiscreteScheduler,
+    EulerDiscreteScheduler,
+    EulerAncestralDiscreteScheduler,
+    DPMSolverMultistepScheduler,
+    UniPCMultistepScheduler,
+)
 from diffusers.utils import logging
 from mmgp import offload
 from shared.utils import files_locator as fl
-from transformers import AutoTokenizer, Qwen3ForCausalLM
+from transformers import AutoTokenizer, T5TokenizerFast, Qwen3ForCausalLM
 
-from models.z_image.autoencoder_kl import AutoencoderKL
+from models.qwen.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
+from models.qwen.convert_diffusers_qwen_vae import convert_state_dict as convert_vae_state_dict
 from .anima_model import AnimaModel
 
 logger = logging.get_logger(__name__)
+
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 0.9,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
 
 
 def conv_state_dict(sd):
@@ -19,11 +42,33 @@ def conv_state_dict(sd):
     out_sd = {}
     for key, tensor in sd.items():
         new_key = key.replace("model.diffusion_model.", "")
+        if new_key.startswith("net."):
+            new_key = new_key[len("net."):]
         out_sd[new_key] = tensor
     return out_sd
 
 
 class model_factory:
+    """Factory for loading and running Anima models."""
+
+    @staticmethod
+    def _pack_latents(latents):
+        """Pack latents from [B, C, 1, H, W] to [B, (H//2)*(W//2), C*4] for transformer."""
+        batch_size, num_channels_latents, _, height, width = latents.shape
+        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+        return latents
+
+    @staticmethod
+    def _unpack_latents(latents, height, width):
+        """Unpack latents from [B, (H//2)*(W//2), C*4] to [B, C, 1, H, W] for VAE."""
+        batch_size, num_patches, channels = latents.shape
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
+        return latents
+
     def __init__(
         self,
         checkpoint_dir,
@@ -43,8 +88,8 @@ class model_factory:
         source = model_def.get("source", None)
 
         transformer_filename = model_filename[0] if isinstance(model_filename, (list, tuple)) else model_filename
-        if transformer_filename is None:
-            raise ValueError("No transformer filename provided for Anima.")
+        if not transformer_filename:
+            raise ValueError("[Anima] No transformer filename provided. Please select an Anima model checkpoint.")
 
         self.base_model_type = base_model_type
         self.model_def = model_def
@@ -55,9 +100,17 @@ class model_factory:
             return conv_state_dict(state_dict)
 
         default_transformer_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", f"{base_model_type}.json")
+        if not os.path.isfile(default_transformer_config):
+            raise FileNotFoundError(
+                f"[Anima] Config file not found: {default_transformer_config}. "
+                f"Expected config for model type '{base_model_type}'."
+            )
 
-        with open(default_transformer_config, "r") as f:
-            config = json.load(f)
+        try:
+            with open(default_transformer_config, "r") as f:
+                config = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"[Anima] Invalid JSON in config {default_transformer_config}: {exc}") from exc
         config.pop("_class_name", None)
         config.pop("_diffusers_version", None)
 
@@ -66,10 +119,19 @@ class model_factory:
         with init_empty_weights():
             transformer = AnimaModel(**config)
 
-        if source is not None:
-            offload.load_model_data(transformer, fl.locate_file(source), **kwargs_light)
-        else:
-            offload.load_model_data(transformer, model_filename, **kwargs_light)
+        try:
+            if source is not None:
+                source_path = fl.locate_file(source)
+                offload.load_model_data(transformer, source_path, **kwargs_light)
+            else:
+                offload.load_model_data(transformer, model_filename, **kwargs_light)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"[Anima] Transformer weights not found: {exc}. "
+                "Please download the Anima model checkpoint."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] Failed to load transformer weights: {exc}") from exc
 
         transformer.to(dtype)
 
@@ -78,42 +140,80 @@ class model_factory:
             save_quantized_model(transformer, model_type, dtype, None, None)
 
         # --- Load Text Encoder (Qwen3 0.6B) ---
-        text_encoder = offload.fast_load_transformers_model(
-            text_encoder_filename,
-            writable_tensors=True,
-            modelClass=Qwen3ForCausalLM,
-        )
+        def preprocess_text_encoder_sd(state_dict):
+            if 'lm_head.weight' not in state_dict and 'model.embed_tokens.weight' in state_dict:
+                state_dict['lm_head.weight'] = state_dict['model.embed_tokens.weight']
+            return state_dict
 
-        # --- Load Tokenizer ---
-        text_encoder_folder = model_def.get("text_encoder_folder")
-        if text_encoder_folder:
-            tokenizer_path = os.path.dirname(fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json")))
-        else:
-            tokenizer_path = os.path.dirname(text_encoder_filename)
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        try:
+            te_config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "qwen3_06b_config.json")
+            text_encoder = offload.fast_load_transformers_model(
+                text_encoder_filename,
+                writable_tensors=True,
+                modelClass=Qwen3ForCausalLM,
+                defaultConfigPath=te_config_file,
+                preprocess_sd=preprocess_text_encoder_sd,
+            )
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"[Anima] Text encoder file not found: {exc}. "
+                "Please download the Qwen3-0.6B text encoder."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] Failed to load text encoder: {exc}") from exc
 
-        # --- Load VAE (Qwen Image VAE - AutoencoderKL) ---
-        vae_filename = fl.locate_file("qwen_image_vae.safetensors")
-        vae_config_path = fl.locate_file("ZImageTurbo_VAE_bf16_config.json")
+        # --- Load Tokenizers ---
+        try:
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[Anima] Failed to load Qwen3-0.6B tokenizer: {exc}. "
+                "Ensure you have internet access or a cached copy of Qwen/Qwen3-0.6B tokenizer."
+            ) from exc
 
-        vae = offload.fast_load_transformers_model(
-            vae_filename,
-            writable_tensors=True,
-            modelClass=AutoencoderKL,
-            defaultConfigPath=vae_config_path,
-            default_dtype=VAE_dtype,
-        )
+        # T5 tokenizer for the LLMAdapter embedding (vocab_size=32128)
+        try:
+            t5_tokenizer = T5TokenizerFast.from_pretrained("google/t5-v1_1-xxl")
+        except Exception as exc:
+            raise RuntimeError(
+                f"[Anima] Failed to load T5-v1.1-XXL tokenizer: {exc}. "
+                "Ensure you have internet access or a cached copy."
+            ) from exc
+
+        # --- Load VAE (Qwen Image VAE - AutoencoderKLQwenImage) ---
+        try:
+            vae_filename = fl.locate_file(os.path.join("Anima", "qwen_image_vae.safetensors"))
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"[Anima] VAE file not found: {exc}. "
+                "Please download the Qwen Image VAE."
+            ) from exc
+
+        try:
+            vae_config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "qwen", "configs", "qwen_image_layered_vae_config.json")
+            vae = offload.fast_load_transformers_model(
+                vae_filename,
+                writable_tensors=True,
+                modelClass=AutoencoderKLQwenImage,
+                defaultConfigPath=vae_config_file,
+                configKwargs={"input_channels": 3},
+                preprocess_sd=convert_vae_state_dict,
+            )
+            vae.to(VAE_dtype)
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] Failed to load VAE: {exc}") from exc
         self.vae = vae
 
         # --- Scheduler ---
         scheduler = FlowMatchEulerDiscreteScheduler(
             num_train_timesteps=1000,
-            shift=3.0,
+            shift=1.0,
         )
 
         self.transformer = transformer
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
+        self.t5_tokenizer = t5_tokenizer
         self.scheduler = scheduler
 
         # Build pipe dict for offload management
@@ -124,31 +224,100 @@ class model_factory:
         }
 
     def _encode_prompt(self, prompt, device="cpu", max_sequence_length=512):
-        """Encode a text prompt using the Qwen3 text encoder."""
+        """Encode a text prompt using the Qwen3 text encoder and T5 tokenizer.
+        Returns UNPADDED embeddings at actual text length (matching ComfyUI's pipeline)."""
         if isinstance(prompt, str):
             prompt = [prompt]
 
-        inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
-
-        with torch.no_grad():
-            outputs = self.text_encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
+        try:
+            inputs = self.tokenizer(
+                prompt,
+                padding=False,
+                truncation=True,
+                max_length=max_sequence_length,
+                return_tensors="pt",
             )
-            # Use the last hidden state
-            hidden_states = outputs.hidden_states[-1]
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] Tokenization failed: {exc}") from exc
 
-        return hidden_states, input_ids
+        input_ids = inputs["input_ids"].to(device=device, dtype=torch.long)
+        attention_mask = inputs["attention_mask"].to(device=device, dtype=torch.long)
+
+        # Ensure at least 1 token (empty prompts produce 0 tokens with padding=False)
+        if input_ids.shape[1] == 0:
+            pad_id = self.tokenizer.pad_token_id or 0
+            input_ids = torch.tensor([[pad_id]], device=device, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids)
+
+        try:
+            with torch.no_grad():
+                outputs = self.text_encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+                hidden_states = outputs.hidden_states[-1]
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] Text encoding failed: {exc}") from exc
+
+        # T5 token IDs for the LLMAdapter embedding (also unpadded)
+        try:
+            t5_inputs = self.t5_tokenizer(
+                prompt,
+                padding=False,
+                truncation=True,
+                max_length=max_sequence_length,
+                return_tensors="pt",
+            )
+            t5_ids = t5_inputs["input_ids"].to(device=device, dtype=torch.long)
+            # Ensure at least 1 token for empty prompts
+            if t5_ids.shape[1] == 0:
+                t5_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] T5 tokenization failed: {exc}") from exc
+
+        return hidden_states, t5_ids
+
+    def _get_scheduler(self, sample_solver, shift=1.0):
+        """Create scheduler based on solver name. Supports ComfyUI-style sampler names."""
+        solver = sample_solver.lower().strip() if sample_solver else "default"
+
+        if solver in ("default", "er_sde", "euler", ""):
+            return FlowMatchEulerDiscreteScheduler(
+                num_train_timesteps=1000,
+                shift=1.0,
+                base_shift=0.5,
+                max_shift=0.9,
+                base_image_seq_len=256,
+                max_image_seq_len=4096,
+                use_dynamic_shifting=True,
+                time_shift_type="exponential",
+                shift_terminal=0.02,
+            )
+        elif solver in ("euler_a", "euler_ancestral"):
+            return EulerAncestralDiscreteScheduler(
+                num_train_timesteps=1000,
+            )
+        elif solver in ("dpmpp_2m_sde", "dpmpp_2m_sde_gpu"):
+            return DPMSolverMultistepScheduler(
+                num_train_timesteps=1000,
+                algorithm_type="sde-dpmsolver++",
+            )
+        elif solver == "unipc":
+            return UniPCMultistepScheduler(
+                num_train_timesteps=1000,
+            )
+        elif solver == "dpmpp_2m":
+            return DPMSolverMultistepScheduler(
+                num_train_timesteps=1000,
+                algorithm_type="dpmsolver++",
+            )
+        else:
+            logger.warning(f"[Anima] Unknown solver '{sample_solver}', using default (flow match euler)")
+            return FlowMatchEulerDiscreteScheduler(
+                num_train_timesteps=1000,
+                shift=shift,
+            )
 
     def generate(
         self,
@@ -164,6 +333,7 @@ class model_factory:
         callback=None,
         max_sequence_length=512,
         VAE_tile_size=0,
+        shift=1.0,
         **kwargs,
     ):
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -171,20 +341,28 @@ class model_factory:
         if self._interrupt:
             return None
 
+        if not hasattr(self, 'transformer') or self.transformer is None:
+            raise RuntimeError("[Anima] Transformer model not loaded. Please load the model first.")
+        if not hasattr(self, 'vae') or self.vae is None:
+            raise RuntimeError("[Anima] VAE not loaded. Please load the model first.")
+
         # Set seed
         generator = torch.Generator(device=device)
-        if seed is None or seed < 0:
+        try:
+            if seed is None or seed < 0:
+                generator.seed()
+            else:
+                generator.manual_seed(int(seed))
+        except Exception as exc:
+            logger.warning(f"[Anima] Seed setup failed, using random: {exc}")
             generator.seed()
-        else:
-            generator.manual_seed(int(seed))
 
-        # Encode prompts
+        # Encode prompts (returns UNPADDED embeddings at actual text length)
         prompt_embeds, prompt_ids = self._encode_prompt(
             input_prompt, device=device, max_sequence_length=max_sequence_length
         )
 
         negative_embeds = None
-        negative_ids = None
         do_cfg = guide_scale > 1.0
         if do_cfg:
             neg = n_prompt if n_prompt and len(n_prompt.strip()) > 0 else ""
@@ -195,78 +373,210 @@ class model_factory:
         if self._interrupt:
             return None
 
-        # Prepare latents
-        # AutoencoderKL uses latent_channels from config (typically 16), spatial downsample 8x
-        latent_channels = self.vae.config.latent_channels if hasattr(self.vae, 'config') else 16
-        latent_h = height // 8
-        latent_w = width // 8
-        # Transformer expects [B, C, T, H, W] with T=1 for images
-        latent_shape = (batch_size, latent_channels, 1, latent_h, latent_w)
-        latents = torch.randn(latent_shape, generator=generator, device=device, dtype=self.dtype)
-
-        # Setup scheduler
-        self.scheduler.set_timesteps(sampling_steps, device=device)
-        timesteps = self.scheduler.timesteps
-
-        callback(-1, None, True, override_num_inference_steps=sampling_steps)
-
-        # Denoising loop
-        for i, t in enumerate(timesteps):
-            if self._interrupt:
-                return None
-
-            latent_model_input = latents
-            timestep = t.expand(batch_size)
-
-            # CFG: concatenate unconditional and conditional inputs
-            if do_cfg and negative_embeds is not None:
-                latent_model_input = torch.cat([latent_model_input] * 2)
-                timestep = torch.cat([timestep] * 2)
-                context = torch.cat([negative_embeds, prompt_embeds])
-                t5xxl_ids = torch.cat([negative_ids, prompt_ids])
-            else:
-                context = prompt_embeds
-                t5xxl_ids = prompt_ids
-
-            # Predict velocity
-            velocity = self.transformer(
-                latent_model_input,
-                timestep,
-                context,
-                t5xxl_ids=t5xxl_ids,
+        # Pre-process through adapter + pad to 512 (matching ComfyUI's extra_conds)
+        # ComfyUI runs the adapter on UNPADDED text, then pads to 512 AFTER.
+        with torch.no_grad():
+            prompt_embeds = self.transformer.preprocess_text_embeds(
+                prompt_embeds.to(dtype=self.dtype), prompt_ids
             )
+            if prompt_embeds.shape[1] < 512:
+                prompt_embeds = F.pad(prompt_embeds, (0, 0, 0, 512 - prompt_embeds.shape[1]))
 
-            # CFG
-            if do_cfg and negative_embeds is not None:
-                velocity_uncond, velocity_cond = velocity.chunk(2)
-                velocity = velocity_uncond + guide_scale * (velocity_cond - velocity_uncond)
-
-            # Scheduler step
-            latents = self.scheduler.step(velocity, t, latents, return_dict=False)[0]
-
-            if callback is not None:
-                # Preview: pass first frame latent for preview
-                latents_preview = latents[:, :, :1]
-                callback(i, latents_preview[0], False)
+            if negative_embeds is not None:
+                negative_embeds = self.transformer.preprocess_text_embeds(
+                    negative_embeds.to(dtype=self.dtype), negative_ids
+                )
+                if negative_embeds.shape[1] < 512:
+                    negative_embeds = F.pad(negative_embeds, (0, 0, 0, 512 - negative_embeds.shape[1]))
 
         if self._interrupt:
             return None
 
-        # Decode latents using Qwen Image VAE (AutoencoderKL)
-        # Squeeze temporal dim: [B, C, 1, H, W] -> [B, C, H, W]
-        decode_latents = latents.squeeze(2)
+        # Prepare latents in 5D [B, C, 1, H, W] — AnimaModel handles patching internally
+        latent_channels = self.vae.config.z_dim if hasattr(self.vae, 'config') else 16
+        latent_h = height // 8
+        latent_w = width // 8
+        latent_shape = (batch_size, latent_channels, 1, latent_h, latent_w)
+        # Keep latents in float32 for stable Euler updates; cast to model dtype only for forward.
+        latents = torch.randn(latent_shape, generator=generator, device=device, dtype=torch.float32)
 
-        # Unscale latents
-        if hasattr(self.vae, 'config'):
-            decode_latents = (decode_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        # Build sigma schedule matching ComfyUI: ModelSamplingDiscreteFlow with shift=3.0, multiplier=1.0
+        SHIFT = 3.0
+        MULTIPLIER = 1.0
+        num_internal = 1000
+        def time_snr_shift(alpha, t):
+            if alpha == 1.0:
+                return t
+            return alpha * t / (1 + (alpha - 1) * t)
+        # Build internal sigma table (matching ModelSamplingDiscreteFlow.set_parameters)
+        internal_sigmas = torch.tensor([
+            time_snr_shift(SHIFT, (i / num_internal) * MULTIPLIER)
+            for i in range(1, num_internal + 1)
+        ])
+        # simple_scheduler: pick evenly spaced from end to start, append 0
+        ss = len(internal_sigmas) / sampling_steps
+        sigmas_list = [float(internal_sigmas[-(1 + int(x * ss))]) for x in range(sampling_steps)]
+        sigmas_list.append(0.0)
+        sigmas = torch.tensor(sigmas_list, device=device)
+        num_steps = sampling_steps
 
-        images = self.vae.decode(decode_latents, return_dict=False)[0]
-        # images: [B, C, H, W], clamp to [-1, 1]
-        images = images.clamp(-1, 1)
+        # --- Sampler selection ---
+        solver = sample_solver.lower().strip() if sample_solver else "er_sde"
+        if solver not in ("er_sde", "euler", "euler_a", "dpmpp_2m_sde"):
+            logger.warning(f"[Anima] Unknown sampler '{sample_solver}', falling back to er_sde")
+            solver = "er_sde"
 
-        # Return as [C, T, H, W] for single image (matching Wan2GP image output convention)
-        # Add temporal dim back: [B, C, H, W] -> [C, 1, H, W] (first batch item)
-        result = images[0].unsqueeze(1)  # [C, 1, H, W]
+        # Noise sampler (shared by stochastic samplers)
+        noise_generator = torch.Generator(device=device)
+        if generator is not None and hasattr(generator, 'initial_seed'):
+            noise_generator.manual_seed(generator.initial_seed() + 1)
+        def sample_noise():
+            return torch.randn(latents.shape, dtype=latents.dtype, device=device, generator=noise_generator)
+
+        # er_sde precomputation
+        if solver == "er_sde":
+            if sigmas[0] >= 1.0:
+                sigmas = sigmas.clone()
+                sigmas[0] = time_snr_shift(SHIFT, (1.0 - 1e-4))
+            half_log_snrs = sigmas.clamp(1e-7, 1.0 - 1e-7).logit().neg()
+            er_lambdas = half_log_snrs.neg().exp()
+            def noise_scaler(x):
+                return x * ((x ** 0.3).exp() + 10.0)
+            num_integration_points = 200.0
+            point_indice = torch.arange(0, num_integration_points, dtype=torch.float32, device=device)
+
+        logger.info(f"[Anima] Denoising: {num_steps} steps, CFG={guide_scale}, sampler={solver}, shift={SHIFT}")
+        callback(-1, None, True, override_num_inference_steps=sampling_steps)
+
+        # Pre-compute CFG context (same every step)
+        if do_cfg and negative_embeds is not None:
+            cfg_context = torch.cat([negative_embeds, prompt_embeds])
+        else:
+            cfg_context = prompt_embeds
+
+        old_denoised = None
+        old_denoised_d = None
+        h_last = None
+
+        for i in tqdm(range(num_steps), desc="Diffusing", leave=True):
+            if self._interrupt:
+                return None
+
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+
+            # --- Common: model forward + CFG ---
+            latent_model_input = latents.to(self.dtype)
+            timestep = sigma.expand(batch_size)
+
+            if do_cfg and negative_embeds is not None:
+                latent_model_input = torch.cat([latent_model_input] * 2)
+                timestep = torch.cat([timestep] * 2)
+
+            model_output = self.transformer(
+                latent_model_input, timestep, cfg_context,
+            ).float()
+
+            if do_cfg and negative_embeds is not None:
+                v_uncond, v_cond = model_output.chunk(2)
+                model_output = v_uncond + guide_scale * (v_cond - v_uncond)
+
+            # CONST velocity prediction: denoised = x - v * sigma
+            denoised = latents - model_output * sigma
+
+            # --- Step update (sampler-specific) ---
+            if sigma_next == 0:
+                latents = denoised
+
+            elif solver == "euler":
+                d = (latents - denoised) / sigma
+                latents = latents + d * (sigma_next - sigma)
+
+            elif solver == "euler_a":
+                # Ancestral step (matching ComfyUI's get_ancestral_step + sample_euler_ancestral)
+                sigma_up = (sigma_next ** 2 * (sigma ** 2 - sigma_next ** 2) / sigma ** 2).sqrt()
+                sigma_down = (sigma_next ** 2 - sigma_up ** 2).sqrt()
+                d = (latents - denoised) / sigma
+                latents = latents + d * (sigma_down - sigma)
+                latents = latents + sample_noise() * sigma_up
+
+            elif solver == "dpmpp_2m_sde":
+                # DPM++ 2M SDE (matching ComfyUI's sample_dpmpp_2m_sde)
+                t, s = -sigma.log(), -sigma_next.log()
+                h = s - t
+                eta_h = h  # eta=1.0
+                latents = (sigma_next / sigma) * (-eta_h).exp() * latents + (-h - eta_h).expm1().neg() * denoised
+                if old_denoised is not None and h_last is not None:
+                    r = h_last / h
+                    latents = latents + ((-h - eta_h).expm1().neg() / (-h - eta_h) + 1) * (1 / r) * (denoised - old_denoised)
+                # SDE noise
+                latents = latents + sample_noise() * sigma_next * (-2 * eta_h).expm1().neg().sqrt()
+                h_last = h
+
+            elif solver == "er_sde":
+                # Extended Reverse-Time SDE (3-stage)
+                stage_used = min(3, i + 1)
+                er_lambda_s = er_lambdas[i]
+                er_lambda_t = er_lambdas[i + 1]
+                alpha_s = 1.0 - sigma.item()
+                alpha_t = 1.0 - sigma_next.item()
+                r_alpha = alpha_t / alpha_s
+                r = noise_scaler(er_lambda_t) / noise_scaler(er_lambda_s)
+
+                latents = r_alpha * r * latents + alpha_t * (1 - r) * denoised
+
+                if stage_used >= 2 and old_denoised is not None:
+                    dt = er_lambda_t - er_lambda_s
+                    lambda_step_size = -dt / num_integration_points
+                    lambda_pos = er_lambda_t + point_indice * lambda_step_size
+                    scaled_pos = noise_scaler(lambda_pos)
+                    s = torch.sum(1 / scaled_pos) * lambda_step_size
+                    denoised_d = (denoised - old_denoised) / (er_lambda_s - er_lambdas[i - 1])
+                    latents = latents + alpha_t * (dt + s * noise_scaler(er_lambda_t)) * denoised_d
+                    if stage_used >= 3 and old_denoised_d is not None:
+                        s_u = torch.sum((lambda_pos - er_lambda_s) / scaled_pos) * lambda_step_size
+                        denoised_u = (denoised_d - old_denoised_d) / ((er_lambda_s - er_lambdas[i - 2]) / 2)
+                        latents = latents + alpha_t * ((dt ** 2) / 2 + s_u * noise_scaler(er_lambda_t)) * denoised_u
+                    old_denoised_d = denoised_d
+
+                noise_amt = (er_lambda_t ** 2 - er_lambda_s ** 2 * r ** 2).sqrt().nan_to_num(nan=0.0)
+                latents = latents + alpha_t * sample_noise() * noise_amt
+
+            old_denoised = denoised
+
+            if callback is not None:
+                callback(i, latents[0, :, :1], False)
+
+        if self._interrupt:
+            return None
+
+        # Decode latents using Qwen Image VAE (AutoencoderKLQwenImage)
+        try:
+            # Denormalize latents: latents * std + mean (reverse of encoding normalization)
+            vae_z_dim = self.vae.config.z_dim
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, vae_z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = (
+                torch.tensor(self.vae.config.latents_std)
+                .view(1, vae_z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            decode_latents = latents * latents_std + latents_mean
+
+            # Cast to VAE dtype
+            vae_dtype = next(self.vae.parameters()).dtype
+            decode_latents = decode_latents.to(dtype=vae_dtype)
+            # Latents are [B, C, 1, H, W] - the 3D VAE expects this format
+            images = self.vae.decode(decode_latents, return_dict=False)[0]
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] VAE decode failed: {exc}") from exc
+
+        # images: [B, C, T, H, W], already clamped by VAE
+        # Return first batch item as [C, T, H, W] (T=1 for images)
+        result = images[0]  # [C, T, H, W]
 
         return {"x": result}
 

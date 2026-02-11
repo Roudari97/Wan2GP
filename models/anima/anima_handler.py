@@ -1,5 +1,10 @@
 import os
+import shutil
+import tempfile
+
 import torch
+from huggingface_hub import hf_hub_download
+from shared.utils import files_locator as fl
 from shared.utils.hf import build_hf_url
 
 
@@ -11,13 +16,19 @@ class family_handler:
             "guidance_max_phases": 1,
             "fit_into_canvas_image_refs": 0,
             "profiles_dir": [],
+            "sample_solvers": [
+                ("er_sde (sharp, flat colors)", "er_sde"),
+                ("euler_a (soft, thin lines)", "euler_a"),
+                ("dpmpp_2m_sde (creative)", "dpmpp_2m_sde"),
+                ("euler", "euler"),
+            ],
         }
 
-        text_encoder_folder = "Qwen3_06B"
+        extra_model_def["source"] = os.path.join("Anima", "anima-preview.safetensors")
         extra_model_def["text_encoder_URLs"] = [
             build_hf_url("circlestone-labs/Anima", "split_files/text_encoders", "qwen_3_06b_base.safetensors"),
         ]
-        extra_model_def["text_encoder_folder"] = text_encoder_folder
+        extra_model_def["text_encoder_folder"] = "Anima"
 
         return extra_model_def
 
@@ -54,31 +65,27 @@ class family_handler:
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
-        download_def = [
-            {
-                "repoId": "Qwen/Qwen3-0.6B",
-                "sourceFolderList": [""],
-                "fileList": [
-                    ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"],
-                ],
-                "targetFolderList": ["Qwen3_06B"],
-            },
-            {
-                "repoId": "circlestone-labs/Anima",
-                "sourceFolderList": ["split_files/vae"],
-                "fileList": [
-                    ["qwen_image_vae.safetensors"],
-                ],
-            },
-            {
-                "repoId": "DeepBeepMeep/Z-Image",
-                "sourceFolderList": [""],
-                "fileList": [
-                    ["ZImageTurbo_VAE_bf16_config.json"],
-                ],
-            },
+        target_dir = os.path.join(fl.get_download_location(), "Anima")
+        repo_id = "circlestone-labs/Anima"
+        files = [
+            ("split_files/diffusion_models", "anima-preview.safetensors"),
+            ("split_files/text_encoders", "qwen_3_06b_base.safetensors"),
+            ("split_files/vae", "qwen_image_vae.safetensors"),
         ]
-        return download_def
+        for subfolder, filename in files:
+            local_path = os.path.join(target_dir, filename)
+            if not os.path.isfile(local_path):
+                os.makedirs(target_dir, exist_ok=True)
+                with tempfile.TemporaryDirectory() as tmp:
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        subfolder=subfolder,
+                        local_dir=tmp,
+                    )
+                    downloaded = os.path.join(tmp, *subfolder.split("/"), filename)
+                    shutil.move(downloaded, local_path)
+        return []
 
     @staticmethod
     def load_model(
@@ -98,19 +105,32 @@ class family_handler:
     ):
         from .anima_main import model_factory
 
-        pipe_processor = model_factory(
-            checkpoint_dir="ckpts",
-            model_filename=model_filename,
-            model_type=model_type,
-            model_def=model_def,
-            base_model_type=base_model_type,
-            text_encoder_filename=text_encoder_filename,
-            quantizeTransformer=quantizeTransformer,
-            dtype=dtype,
-            VAE_dtype=VAE_dtype,
-            mixed_precision_transformer=mixed_precision_transformer,
-            save_quantized=save_quantized,
-        )
+        if not model_filename:
+            raise ValueError("[Anima] No model filename provided. Please select an Anima model checkpoint.")
+        if not text_encoder_filename:
+            raise ValueError("[Anima] No text encoder filename provided. Ensure Qwen3-0.6B is downloaded.")
+
+        try:
+            pipe_processor = model_factory(
+                checkpoint_dir="ckpts",
+                model_filename=model_filename,
+                model_type=model_type,
+                model_def=model_def,
+                base_model_type=base_model_type,
+                text_encoder_filename=text_encoder_filename,
+                quantizeTransformer=quantizeTransformer,
+                dtype=dtype,
+                VAE_dtype=VAE_dtype,
+                mixed_precision_transformer=mixed_precision_transformer,
+                save_quantized=save_quantized,
+            )
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"[Anima] Required model file not found: {exc}. "
+                "Please ensure all Anima model files are downloaded via the Downloads tab."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"[Anima] Failed to load model: {exc}") from exc
 
         pipe = {
             "transformer": pipe_processor.transformer,
@@ -121,9 +141,13 @@ class family_handler:
 
     @staticmethod
     def get_rgb_factors(base_model_type):
-        from shared.RGB_factors import get_rgb_factors
-        latent_rgb_factors, latent_rgb_factors_bias = get_rgb_factors("flux")
-        return latent_rgb_factors, latent_rgb_factors_bias
+        try:
+            from shared.RGB_factors import get_rgb_factors
+            latent_rgb_factors, latent_rgb_factors_bias = get_rgb_factors("flux")
+            return latent_rgb_factors, latent_rgb_factors_bias
+        except Exception as exc:
+            print(f"[Anima] Warning: failed to load RGB factors, using None: {exc}")
+            return None, None
 
     @staticmethod
     def set_cache_parameters(cache_type, base_model_type, model_def, inputs, skip_steps_cache):
@@ -135,5 +159,7 @@ class family_handler:
             {
                 "guidance_scale": 4,
                 "num_inference_steps": 30,
+                "flow_shift": 1.0,
+                "sample_solver": "er_sde",
             }
         )

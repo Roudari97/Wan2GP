@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat as einops_repeat
 from einops.layers.torch import Rearrange
 
 from shared.attention import pay_attention
@@ -28,6 +28,7 @@ def apply_rotary_pos_emb_predict2(t, freqs):
 
 
 class VideoRopePosition3DEmb(nn.Module):
+    """Matches ComfyUI's VideoRopePosition3DEmb exactly (comfy/ldm/cosmos/position_embedding.py)."""
     def __init__(
         self,
         model_channels,
@@ -37,6 +38,7 @@ class VideoRopePosition3DEmb(nn.Module):
         head_dim,
         max_fps=30,
         min_fps=1,
+        base_fps=24,
         is_learnable=False,
         interpolation="crop",
         h_extrapolation_ratio=1.0,
@@ -47,53 +49,63 @@ class VideoRopePosition3DEmb(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.head_dim = head_dim
-        self.len_h = len_h
-        self.len_w = len_w
-        self.len_t = len_t
-        self.h_extrapolation_ratio = h_extrapolation_ratio
-        self.w_extrapolation_ratio = w_extrapolation_ratio
-        self.t_extrapolation_ratio = t_extrapolation_ratio
+        self.base_fps = base_fps
+        self.max_h = len_h
+        self.max_w = len_w
+        self.enable_fps_modulation = enable_fps_modulation
 
         dim = head_dim
-        h_dim = dim // 6 * 2
-        w_dim = dim // 6 * 2
-        t_dim = dim - h_dim - w_dim
+        dim_h = dim // 6 * 2
+        dim_w = dim_h
+        dim_t = dim - 2 * dim_h
 
-        self.h_dim = h_dim
-        self.w_dim = w_dim
-        self.t_dim = t_dim
+        self.register_buffer(
+            "dim_spatial_range",
+            torch.arange(0, dim_h, 2, device=device)[: (dim_h // 2)].float() / dim_h,
+            persistent=False,
+        )
+        self.register_buffer(
+            "dim_temporal_range",
+            torch.arange(0, dim_t, 2, device=device)[: (dim_t // 2)].float() / dim_t,
+            persistent=False,
+        )
 
-    def _get_freqs(self, length, dim, theta=10000.0, extrapolation_ratio=1.0, device=None):
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
-        freqs = freqs / extrapolation_ratio
-        t = torch.arange(length, device=device).float()
-        freqs = torch.outer(t, freqs)
-        freqs_cos = freqs.cos()
-        freqs_sin = freqs.sin()
-        freqs = torch.stack([freqs_cos, -freqs_sin, freqs_sin, freqs_cos], dim=-1)
-        freqs = rearrange(freqs, "... (r1 r2) -> ... r1 r2", r1=2, r2=2)
-        return freqs
+        self.h_ntk_factor = h_extrapolation_ratio ** (dim_h / (dim_h - 2))
+        self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2))
+        self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2))
 
     def forward(self, x_B_T_H_W_D, fps=None, device=None):
-        B, T, H, W, D = x_B_T_H_W_D.shape
+        B, T, H, W, _ = x_B_T_H_W_D.shape
         device = device or x_B_T_H_W_D.device
 
-        freqs_h = self._get_freqs(H, self.h_dim, extrapolation_ratio=self.h_extrapolation_ratio, device=device)
-        freqs_w = self._get_freqs(W, self.w_dim, extrapolation_ratio=self.w_extrapolation_ratio, device=device)
-        freqs_t = self._get_freqs(T, self.t_dim, extrapolation_ratio=self.t_extrapolation_ratio, device=device)
+        h_theta = 10000.0 * self.h_ntk_factor
+        w_theta = 10000.0 * self.w_ntk_factor
+        t_theta = 10000.0 * self.t_ntk_factor
 
-        freqs_h = freqs_h[None, None, :, None, :, :]  # 1, 1, H, 1, dim, 2x2
-        freqs_w = freqs_w[None, None, None, :, :, :]  # 1, 1, 1, W, dim, 2x2
-        freqs_t = freqs_t[None, :, None, None, :, :]  # 1, T, 1, 1, dim, 2x2
+        h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range.to(device=device))
+        w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range.to(device=device))
+        temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range.to(device=device))
 
-        freqs_h = freqs_h.expand(1, T, H, W, -1, -1)
-        freqs_w = freqs_w.expand(1, T, H, W, -1, -1)
-        freqs_t = freqs_t.expand(1, T, H, W, -1, -1)
+        seq = torch.arange(max(H, W, T), dtype=torch.float, device=device)
+        half_emb_h = torch.outer(seq[:H], h_spatial_freqs)
+        half_emb_w = torch.outer(seq[:W], w_spatial_freqs)
 
-        freqs = torch.cat([freqs_t, freqs_h, freqs_w], dim=-2)  # 1, T, H, W, head_dim/2, 2x2
-        freqs = rearrange(freqs, "b t h w d r1 r2 -> b (t h w) d r1 r2")
-        return freqs
+        if fps is None or self.enable_fps_modulation is False:
+            half_emb_t = torch.outer(seq[:T], temporal_freqs)
+        else:
+            half_emb_t = torch.outer(seq[:T] / fps * self.base_fps, temporal_freqs)
+
+        half_emb_h = torch.stack([torch.cos(half_emb_h), -torch.sin(half_emb_h), torch.sin(half_emb_h), torch.cos(half_emb_h)], dim=-1)
+        half_emb_w = torch.stack([torch.cos(half_emb_w), -torch.sin(half_emb_w), torch.sin(half_emb_w), torch.cos(half_emb_w)], dim=-1)
+        half_emb_t = torch.stack([torch.cos(half_emb_t), -torch.sin(half_emb_t), torch.sin(half_emb_t), torch.cos(half_emb_t)], dim=-1)
+
+        em_T_H_W_D = torch.cat([
+            einops_repeat(half_emb_t, "t d x -> t h w d x", h=H, w=W),
+            einops_repeat(half_emb_h, "h d x -> t h w d x", t=T, w=W),
+            einops_repeat(half_emb_w, "w d x -> t h w d x", t=T, h=H),
+        ], dim=-2)
+
+        return rearrange(em_T_H_W_D, "t h w d (i j) -> (t h w) d i j", i=2, j=2).float()
 
 
 # ---------------------- Feed Forward Network -----------------------
@@ -173,15 +185,26 @@ class Timesteps(nn.Module):
 
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features, out_features, use_adaln_lora=True):
         super().__init__()
-        self.linear_1 = nn.Linear(in_features, out_features, bias=True)
+        self.out_features = out_features
+        self.use_adaln_lora = use_adaln_lora
+        self.linear_1 = nn.Linear(in_features, out_features, bias=not use_adaln_lora)
         self.activation = nn.SiLU()
-        self.linear_2 = nn.Linear(out_features, out_features, bias=False)
+        if use_adaln_lora:
+            self.linear_2 = nn.Linear(out_features, 3 * out_features, bias=False)
+        else:
+            self.linear_2 = nn.Linear(out_features, out_features, bias=False)
 
     def forward(self, sample):
         emb = self.linear_2(self.activation(self.linear_1(sample)))
-        return emb, None  # (emb, adaln_lora=None)
+        if self.use_adaln_lora:
+            adaln_lora_B_T_3D = emb           # full 3*D output
+            emb_B_T_D = sample                 # raw sinusoidal embedding (D)
+        else:
+            adaln_lora_B_T_3D = None
+            emb_B_T_D = emb
+        return emb_B_T_D, adaln_lora_B_T_3D
 
 
 # ---------------------- Patch Embed -----------------------
@@ -209,7 +232,8 @@ class PatchEmbed(nn.Module):
 # ---------------------- Final Layer -----------------------
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, spatial_patch_size, temporal_patch_size, out_channels):
+    def __init__(self, hidden_size, spatial_patch_size, temporal_patch_size, out_channels,
+                 use_adaln_lora=False, adaln_lora_dim=256, **kwargs):
         super().__init__()
         self.layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
@@ -218,13 +242,28 @@ class FinalLayer(nn.Module):
             bias=False,
         )
         self.hidden_size = hidden_size
-        self.adaln_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=False),
-        )
+        self.n_adaln_chunks = 2
+        self.use_adaln_lora = use_adaln_lora
+        if use_adaln_lora:
+            self.adaln_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, self.n_adaln_chunks * hidden_size, bias=False),
+            )
+        else:
+            self.adaln_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=False),
+            )
 
     def forward(self, x_B_T_H_W_D, emb_B_T_D, adaln_lora_B_T_3D=None):
-        shift, scale = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
+        if self.use_adaln_lora:
+            assert adaln_lora_B_T_3D is not None
+            shift, scale = (
+                self.adaln_modulation(emb_B_T_D) + adaln_lora_B_T_3D[:, :, :2 * self.hidden_size]
+            ).chunk(2, dim=-1)
+        else:
+            shift, scale = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
         shift = rearrange(shift, "b t d -> b t 1 1 d")
         scale = rearrange(scale, "b t d -> b t 1 1 d")
         x_B_T_H_W_D = self.layer_norm(x_B_T_H_W_D) * (1 + scale) + shift
@@ -234,35 +273,74 @@ class FinalLayer(nn.Module):
 # ---------------------- Transformer Block -----------------------
 
 class Block(nn.Module):
-    def __init__(self, x_dim, context_dim, num_heads, mlp_ratio=4.0):
+    def __init__(self, x_dim, context_dim, num_heads, mlp_ratio=4.0,
+                 use_adaln_lora=False, adaln_lora_dim=256):
         super().__init__()
         self.x_dim = x_dim
+        self.num_heads = num_heads
+        self.head_dim = x_dim // num_heads
+        self.use_adaln_lora = use_adaln_lora
 
         self.layer_norm_self_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
-        self.self_attn = Predict2Attention(x_dim, None, num_heads, x_dim // num_heads)
+        self.self_attn = Predict2Attention(x_dim, None, num_heads, self.head_dim)
 
         self.layer_norm_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
-        self.cross_attn = Predict2Attention(x_dim, context_dim, num_heads, x_dim // num_heads)
+        self.cross_attn = Predict2Attention(x_dim, context_dim, num_heads, self.head_dim)
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
 
-        self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-        self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-        self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+        if use_adaln_lora:
+            self.adaln_modulation_self_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+            )
+            self.adaln_modulation_cross_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+            )
+            self.adaln_modulation_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+            )
+        else:
+            self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
 
-    def forward(self, x_B_T_H_W_D, emb_B_T_D, crossattn_emb, rope_emb_L_1_1_D=None, **kwargs):
-        residual_dtype = x_B_T_H_W_D.dtype
-        compute_dtype = emb_B_T_D.dtype
+    def forward(self, x_B_T_H_W_D, emb_B_T_D, crossattn_emb, rope_emb_L_1_1_D=None,
+                adaln_lora_B_T_3D=None, extra_per_block_pos_emb=None, **kwargs):
+        if extra_per_block_pos_emb is not None:
+            x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        shift_sa, scale_sa, gate_sa = self.adaln_modulation_self_attn(emb_B_T_D).chunk(3, dim=-1)
-        shift_ca, scale_ca, gate_ca = self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
-        shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+        if self.use_adaln_lora:
+            shift_sa, scale_sa, gate_sa = (
+                self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            shift_ca, scale_ca, gate_ca = (
+                self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            shift_mlp, scale_mlp, gate_mlp = (
+                self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+        else:
+            shift_sa, scale_sa, gate_sa = self.adaln_modulation_self_attn(emb_B_T_D).chunk(3, dim=-1)
+            shift_ca, scale_ca, gate_ca = self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
+            shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
 
-        # Reshape for broadcasting: (B, T, D) -> (B, T, 1, 1, D)
-        shift_sa, scale_sa, gate_sa = [rearrange(t, "b t d -> b t 1 1 d") for t in [shift_sa, scale_sa, gate_sa]]
-        shift_ca, scale_ca, gate_ca = [rearrange(t, "b t d -> b t 1 1 d") for t in [shift_ca, scale_ca, gate_ca]]
-        shift_mlp, scale_mlp, gate_mlp = [rearrange(t, "b t d -> b t 1 1 d") for t in [shift_mlp, scale_mlp, gate_mlp]]
+        # Reshape (B, T, D) -> (B, T, 1, 1, D) for broadcasting over H, W
+        shift_sa = rearrange(shift_sa, "b t d -> b t 1 1 d")
+        scale_sa = rearrange(scale_sa, "b t d -> b t 1 1 d")
+        gate_sa = rearrange(gate_sa, "b t d -> b t 1 1 d")
+        shift_ca = rearrange(shift_ca, "b t d -> b t 1 1 d")
+        scale_ca = rearrange(scale_ca, "b t d -> b t 1 1 d")
+        gate_ca = rearrange(gate_ca, "b t d -> b t 1 1 d")
+        shift_mlp = rearrange(shift_mlp, "b t d -> b t 1 1 d")
+        scale_mlp = rearrange(scale_mlp, "b t d -> b t 1 1 d")
+        gate_mlp = rearrange(gate_mlp, "b t d -> b t 1 1 d")
 
         B, T, H, W, D = x_B_T_H_W_D.shape
 
@@ -273,28 +351,28 @@ class Block(nn.Module):
         normed = _adaln(x_B_T_H_W_D, self.layer_norm_self_attn, scale_sa, shift_sa)
         sa_out = rearrange(
             self.self_attn(
-                rearrange(normed.to(compute_dtype), "b t h w d -> b (t h w) d"),
+                rearrange(normed, "b t h w d -> b (t h w) d"),
                 rope_emb=rope_emb_L_1_1_D,
             ),
             "b (t h w) d -> b t h w d", t=T, h=H, w=W,
         )
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_sa.to(residual_dtype) * sa_out.to(residual_dtype)
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_sa * sa_out
 
         # Cross-attention
         normed = _adaln(x_B_T_H_W_D, self.layer_norm_cross_attn, scale_ca, shift_ca)
         ca_out = rearrange(
             self.cross_attn(
-                rearrange(normed.to(compute_dtype), "b t h w d -> b (t h w) d"),
+                rearrange(normed, "b t h w d -> b (t h w) d"),
                 crossattn_emb,
             ),
             "b (t h w) d -> b t h w d", t=T, h=H, w=W,
         )
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_ca.to(residual_dtype) * ca_out.to(residual_dtype)
+        x_B_T_H_W_D = ca_out * gate_ca + x_B_T_H_W_D
 
         # MLP
         normed = _adaln(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
-        mlp_out = self.mlp(normed.to(compute_dtype))
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp.to(residual_dtype) * mlp_out.to(residual_dtype)
+        mlp_out = self.mlp(normed)
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp * mlp_out
 
         return x_B_T_H_W_D
 
@@ -304,9 +382,9 @@ class Block(nn.Module):
 class MiniTrainDIT(nn.Module):
     def __init__(
         self,
-        max_img_h=1024,
-        max_img_w=1024,
-        max_frames=1,
+        max_img_h=240,
+        max_img_w=240,
+        max_frames=128,
         in_channels=16,
         out_channels=16,
         patch_spatial=2,
@@ -314,7 +392,7 @@ class MiniTrainDIT(nn.Module):
         concat_padding_mask=True,
         model_channels=2048,
         num_blocks=28,
-        num_heads=32,
+        num_heads=16,
         mlp_ratio=4.0,
         crossattn_emb_channels=1024,
         pos_emb_cls="rope3d",
@@ -322,10 +400,16 @@ class MiniTrainDIT(nn.Module):
         pos_emb_interpolation="crop",
         min_fps=1,
         max_fps=30,
+        use_adaln_lora=False,
+        adaln_lora_dim=256,
         rope_h_extrapolation_ratio=1.0,
         rope_w_extrapolation_ratio=1.0,
         rope_t_extrapolation_ratio=1.0,
         extra_per_block_abs_pos_emb=False,
+        extra_h_extrapolation_ratio=1.0,
+        extra_w_extrapolation_ratio=1.0,
+        extra_t_extrapolation_ratio=1.0,
+        rope_enable_fps_modulation=True,
         image_model=None,
         **kwargs,
     ):
@@ -342,6 +426,9 @@ class MiniTrainDIT(nn.Module):
         self.model_channels = model_channels
         self.concat_padding_mask = concat_padding_mask
         self.pos_emb_cls = pos_emb_cls
+        self.use_adaln_lora = use_adaln_lora
+        self.adaln_lora_dim = adaln_lora_dim
+        self.extra_per_block_abs_pos_emb = extra_per_block_abs_pos_emb
 
         # Positional embeddings
         self.pos_embedder = VideoRopePosition3DEmb(
@@ -381,6 +468,8 @@ class MiniTrainDIT(nn.Module):
                 context_dim=crossattn_emb_channels,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
+                use_adaln_lora=use_adaln_lora,
+                adaln_lora_dim=adaln_lora_dim,
             )
             for _ in range(num_blocks)
         ])
@@ -391,6 +480,8 @@ class MiniTrainDIT(nn.Module):
             spatial_patch_size=patch_spatial,
             temporal_patch_size=patch_temporal,
             out_channels=out_channels,
+            use_adaln_lora=use_adaln_lora,
+            adaln_lora_dim=adaln_lora_dim,
         )
 
         self.t_embedding_norm = nn.RMSNorm(model_channels, eps=1e-6)
@@ -424,9 +515,13 @@ class MiniTrainDIT(nn.Module):
         )
 
     def forward(self, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
+        if x.ndim != 5:
+            raise ValueError(f"[Anima] Expected 5D input tensor [B,C,T,H,W], got shape {x.shape}")
+        if context is None:
+            raise ValueError("[Anima] Context (text embeddings) cannot be None")
         orig_shape = list(x.shape)
 
-        # Pad to patch size
+        # Pad to patch size (matching ComfyUI's common_dit.pad_to_patch_size)
         ps = self.patch_spatial
         pt = self.patch_temporal
         _, _, T, H, W = x.shape
@@ -441,19 +536,21 @@ class MiniTrainDIT(nn.Module):
         if timesteps.ndim == 1:
             timesteps = timesteps.unsqueeze(1)
 
-        t_emb, adaln_lora = self.t_embedder[1](self.t_embedder[0](timesteps).to(x_B_T_H_W_D.dtype))
+        t_emb, adaln_lora_B_T_3D = self.t_embedder[1](self.t_embedder[0](timesteps).to(x_B_T_H_W_D.dtype))
         t_emb = self.t_embedding_norm(t_emb)
 
         rope_emb_expanded = rope_emb.unsqueeze(1).unsqueeze(0) if rope_emb is not None else None
 
-        # fp16 residual stream fix
-        if x_B_T_H_W_D.dtype == torch.float16:
-            x_B_T_H_W_D = x_B_T_H_W_D.float()
+        block_kwargs = {
+            "rope_emb_L_1_1_D": rope_emb_expanded,
+            "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
+            "extra_per_block_pos_emb": None,
+        }
 
         for block in self.blocks:
-            x_B_T_H_W_D = block(x_B_T_H_W_D, t_emb, context, rope_emb_L_1_1_D=rope_emb_expanded)
+            x_B_T_H_W_D = block(x_B_T_H_W_D, t_emb, context, **block_kwargs)
 
-        x_out = self.final_layer(x_B_T_H_W_D.to(context.dtype), t_emb)
+        x_out = self.final_layer(x_B_T_H_W_D, t_emb, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_out = self.unpatchify(x_out)[:, :, :orig_shape[-3], :orig_shape[-2], :orig_shape[-1]]
         return x_out
 
@@ -614,14 +711,14 @@ class AnimaModel(MiniTrainDIT):
 
     def preprocess_text_embeds(self, text_embeds, text_ids):
         if text_ids is not None:
-            out = self.llm_adapter(text_embeds, text_ids)
-            if out.shape[1] < 512:
-                out = F.pad(out, (0, 0, 0, 512 - out.shape[1]))
-            return out
+            return self.llm_adapter(text_embeds, text_ids)
         return text_embeds
 
     def forward(self, x, timesteps, context, **kwargs):
         t5xxl_ids = kwargs.pop("t5xxl_ids", None)
+        kwargs.pop("_debug", None)
         if t5xxl_ids is not None:
             context = self.preprocess_text_embeds(context, t5xxl_ids)
+            if context.shape[1] < 512:
+                context = F.pad(context, (0, 0, 0, 512 - context.shape[1]))
         return super().forward(x, timesteps, context, **kwargs)

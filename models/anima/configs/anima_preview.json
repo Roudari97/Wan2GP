@@ -9,13 +9,17 @@
     "concat_padding_mask": true,
     "model_channels": 2048,
     "num_blocks": 28,
-    "num_heads": 32,
+    "num_heads": 16,
     "mlp_ratio": 4.0,
     "crossattn_emb_channels": 1024,
     "pos_emb_cls": "rope3d",
     "pos_emb_learnable": false,
     "pos_emb_interpolation": "crop",
-    "rope_h_extrapolation_ratio": 1.0,
-    "rope_w_extrapolation_ratio": 1.0,
-    "rope_t_extrapolation_ratio": 1.0
+    "rope_h_extrapolation_ratio": 4.0,
+    "rope_w_extrapolation_ratio": 4.0,
+    "rope_t_extrapolation_ratio": 1.0,
+    "use_adaln_lora": true,
+    "adaln_lora_dim": 256,
+    "extra_per_block_abs_pos_emb": false,
+    "rope_enable_fps_modulation": false
 }

@@ -1,15 +1,16 @@
 {
-	"model":
-	{
+	"model": {
 		"name": "Anima 2B Preview",
-		"architecture" : "anima_preview",
-		"description": "Anima 2B Preview - Text to Image model based on Cosmos Predict2 architecture with Qwen3 0.6B text encoder",
+		"architecture": "anima_preview",
+		"description": "Anima 2B Preview - Text to Image model based on Cosmos Predict2 architecture with Qwen3 0.6B text encoder | steps: 30-40, cfg: 4-5 |\n er_sde: neutral style, flat colors, sharp lines. I use this as a reasonable default. |\n euler_a: Softer, thinner lines. Can sometimes tend towards a 2.5D look. CFG can be pushed a bit higher than other samplers without burning the image. |\n dpmpp_2m_sde_gpu: similar in style to er_sde but can produce more variety and be more 'creative'. Depending on the prompt it can get too wild sometimes.",
 		"URLs": [
 			"https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors"
 		]
 	},
+	"prompt": "masterpiece, best quality, score_7, safe. An anime girl wearing a black tank-top and denim shorts is standing outdoors. She's holding a rectangular sign out in front of her that reads 'ANIMA'. She's looking at the viewer with a smile. The background features some trees and blue sky with clouds.",
 	"resolution": "1024x1024",
 	"batch_size": 1,
 	"num_inference_steps": 30,
-	"guidance_scale": 4
+	"guidance_scale": 4,
+	"flow_shift": 3.0
 }
