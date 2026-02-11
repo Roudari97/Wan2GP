@@ -8,6 +8,7 @@ from mmgp import offload
 from shared.utils import files_locator as fl
 from transformers import AutoTokenizer, Qwen3ForCausalLM
 
+from models.z_image.autoencoder_kl import AutoencoderKL
 from .anima_model import AnimaModel
 
 logger = logging.get_logger(__name__)
@@ -116,15 +117,18 @@ class model_factory:
             tokenizer_path = os.path.dirname(text_encoder_filename)
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
-        # --- Load VAE (Wan2.1 VAE for Wan21 latent format) ---
-        from models.wan.modules.vae import WanVAE
-        vae_urls = model_def.get("VAE_URLs", [])
-        if isinstance(vae_urls, list) and len(vae_urls) > 0:
-            vae_file = fl.locate_file(os.path.basename(vae_urls[0]))
-        else:
-            vae_file = "Wan2.1_VAE.safetensors"
-        self.vae = WanVAE(vae_pth=fl.locate_file(vae_file), dtype=VAE_dtype, device="cpu")
-        self.vae.device = "cpu"
+        # --- Load VAE (Qwen Image VAE - AutoencoderKL) ---
+        vae_filename = fl.locate_file("qwen_image_vae.safetensors")
+        vae_config_path = fl.locate_file("ZImageTurbo_VAE_bf16_config.json")
+
+        vae = offload.fast_load_transformers_model(
+            vae_filename,
+            writable_tensors=True,
+            modelClass=AutoencoderKL,
+            defaultConfigPath=vae_config_path,
+            default_dtype=VAE_dtype,
+        )
+        self.vae = vae
 
         # --- Scheduler ---
         scheduler = FlowMatchEulerDiscreteScheduler(
@@ -141,7 +145,7 @@ class model_factory:
         self.pipe = {
             "transformer": transformer,
             "text_encoder": text_encoder,
-            "vae": self.vae.model,
+            "vae": self.vae,
         }
 
     def _encode_prompt(self, prompt, device="cpu", max_sequence_length=512):
@@ -216,10 +220,13 @@ class model_factory:
         if self._interrupt:
             return None
 
-        # Prepare latents (Wan21 format: 16 channels, spatial downsample 8x)
+        # Prepare latents
+        # AutoencoderKL uses latent_channels from config (typically 16), spatial downsample 8x
+        latent_channels = self.vae.config.latent_channels if hasattr(self.vae, 'config') else 16
         latent_h = height // 8
         latent_w = width // 8
-        latent_shape = (batch_size, 16, 1, latent_h, latent_w)
+        # Transformer expects [B, C, T, H, W] with T=1 for images
+        latent_shape = (batch_size, latent_channels, 1, latent_h, latent_w)
         latents = torch.randn(latent_shape, generator=generator, device=device, dtype=self.dtype)
 
         # Setup scheduler
@@ -270,20 +277,21 @@ class model_factory:
         if self._interrupt:
             return None
 
-        # Decode latents using Wan VAE
-        # WanVAE.decode handles normalization internally via self.scale
-        # Unbind batch dim: list of [C, T, H, W] tensors
-        x0 = latents.unbind(dim=0)
-        # Take only first frame for image output
-        x0 = [x[:, :1] for x in x0]
+        # Decode latents using Qwen Image VAE (AutoencoderKL)
+        # Squeeze temporal dim: [B, C, 1, H, W] -> [B, C, H, W]
+        decode_latents = latents.squeeze(2)
 
-        videos = self.vae.decode(x0, VAE_tile_size)
+        # Unscale latents
+        if hasattr(self.vae, 'config'):
+            decode_latents = (decode_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
-        # Return format: [C, T, H, W] matching Wan model image output
-        if len(videos) > 1:
-            result = torch.cat([video[:, :1] for video in videos], dim=1)
-        else:
-            result = videos[0][:, :1]
+        images = self.vae.decode(decode_latents, return_dict=False)[0]
+        # images: [B, C, H, W], clamp to [-1, 1]
+        images = images.clamp(-1, 1)
+
+        # Return as [C, T, H, W] for single image (matching Wan2GP image output convention)
+        # Add temporal dim back: [B, C, H, W] -> [C, 1, H, W] (first batch item)
+        result = images[0].unsqueeze(1)  # [C, 1, H, W]
 
         return {"x": result}
 

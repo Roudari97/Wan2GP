@@ -62,7 +62,21 @@ class family_handler:
                     ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"],
                 ],
                 "targetFolderList": ["Qwen3_06B"],
-            }
+            },
+            {
+                "repoId": "circlestone-labs/Anima",
+                "sourceFolderList": ["split_files/vae"],
+                "fileList": [
+                    ["qwen_image_vae.safetensors"],
+                ],
+            },
+            {
+                "repoId": "DeepBeepMeep/Z-Image",
+                "sourceFolderList": [""],
+                "fileList": [
+                    ["ZImageTurbo_VAE_bf16_config.json"],
+                ],
+            },
         ]
         return download_def
 
@@ -101,14 +115,14 @@ class family_handler:
         pipe = {
             "transformer": pipe_processor.transformer,
             "text_encoder": pipe_processor.text_encoder,
-            "vae": pipe_processor.vae.model,
+            "vae": pipe_processor.vae,
         }
         return pipe_processor, pipe
 
     @staticmethod
     def get_rgb_factors(base_model_type):
         from shared.RGB_factors import get_rgb_factors
-        latent_rgb_factors, latent_rgb_factors_bias = get_rgb_factors("wan")
+        latent_rgb_factors, latent_rgb_factors_bias = get_rgb_factors("flux")
         return latent_rgb_factors, latent_rgb_factors_bias
 
     @staticmethod
