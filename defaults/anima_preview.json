@@ -2,7 +2,7 @@
 	"model":
 	{
 		"name": "Anima 2B Preview",
-		"architecture" : "anima",
+		"architecture" : "anima_preview",
 		"description": "Anima 2B Preview - Text to Image model based on Cosmos Predict2 architecture with Qwen3 0.6B text encoder",
 		"URLs": [
 			"https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors"

@@ -23,7 +23,7 @@ class family_handler:
 
     @staticmethod
     def query_supported_types():
-        return ["anima"]
+        return ["anima_preview"]
 
     @staticmethod
     def query_family_maps():
