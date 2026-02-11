@@ -7,5 +7,9 @@
 		"URLs": [
 			"https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors"
 		]
-	}
+	},
+	"resolution": "1024x1024",
+	"batch_size": 1,
+	"num_inference_steps": 30,
+	"guidance_scale": 4
 }
