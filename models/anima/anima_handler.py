@@ -8,6 +8,36 @@ from shared.utils import files_locator as fl
 from shared.utils.hf import build_hf_url
 
 
+def _parse_hf_resolve_url(url):
+    if not isinstance(url, str) or not url.startswith("https://huggingface.co/"):
+        return None
+    marker = "/resolve/main/"
+    if marker not in url:
+        return None
+    repo_part, file_part = url[len("https://huggingface.co/") :].split(marker, 1)
+    if not repo_part or not file_part:
+        return None
+    filename = os.path.basename(file_part)
+    subfolder = os.path.dirname(file_part).replace("\\", "/")
+    return repo_part, subfolder, filename
+
+
+def _get_diffusion_download_specs(model_def):
+    urls = model_def.get("URLs", []) if isinstance(model_def, dict) else []
+    if isinstance(urls, str):
+        urls = [urls]
+    specs = []
+    for url in urls:
+        parsed = _parse_hf_resolve_url(url)
+        if parsed is None:
+            continue
+        repo_id, subfolder, filename = parsed
+        if not filename.endswith(".safetensors"):
+            continue
+        specs.append((repo_id, subfolder, filename))
+    return specs
+
+
 class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
@@ -15,7 +45,23 @@ class family_handler:
             "image_outputs": True,
             "guidance_max_phases": 1,
             "fit_into_canvas_image_refs": 0,
-            "profiles_dir": [],
+            "profiles_dir": ["anima"],
+            "image_prompt_types_allowed": "S",
+            "inpaint_support": True,
+            "inpaint_video_prompt_type": "VAG",
+            "mask_preprocessing": {
+                "selection": ["", "A"],
+                "visible": True,
+            },
+            "model_modes": {
+                "choices": [
+                    ("Masked Denoising : Inpainted area may reuse some content that has been masked", 0),
+                    ("Lora Inpainting: Inpainted area completely unrelated to masked content", 1),
+                ],
+                "default": 0,
+                "label": "Inpainting Method",
+                "image_modes": [2],
+            },
             "sample_solvers": [
                 ("er_sde (sharp, flat colors)", "er_sde"),
                 ("euler_a (soft, thin lines)", "euler_a"),
@@ -24,7 +70,11 @@ class family_handler:
             ],
         }
 
-        extra_model_def["source"] = os.path.join("Anima", "anima-preview.safetensors")
+        diffusion_specs = _get_diffusion_download_specs(model_def)
+        if diffusion_specs:
+            extra_model_def["source"] = os.path.join("Anima", diffusion_specs[0][2])
+        else:
+            extra_model_def["source"] = os.path.join("Anima", "anima-preview.safetensors")
         extra_model_def["text_encoder_URLs"] = [
             build_hf_url("circlestone-labs/Anima", "split_files/text_encoders", "qwen_3_06b_base.safetensors"),
         ]
@@ -66,13 +116,15 @@ class family_handler:
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         target_dir = os.path.join(fl.get_download_location(), "Anima")
-        repo_id = "circlestone-labs/Anima"
-        files = [
-            ("split_files/diffusion_models", "anima-preview.safetensors"),
-            ("split_files/text_encoders", "qwen_3_06b_base.safetensors"),
-            ("split_files/vae", "qwen_image_vae.safetensors"),
+        diffusion_specs = _get_diffusion_download_specs(model_def)
+        if not diffusion_specs:
+            diffusion_specs = [("circlestone-labs/Anima", "split_files/diffusion_models", "anima-preview.safetensors")]
+
+        files = list(diffusion_specs) + [
+            ("circlestone-labs/Anima", "split_files/text_encoders", "qwen_3_06b_base.safetensors"),
+            ("circlestone-labs/Anima", "split_files/vae", "qwen_image_vae.safetensors"),
         ]
-        for subfolder, filename in files:
+        for repo_id, subfolder, filename in files:
             local_path = os.path.join(target_dir, filename)
             if not os.path.isfile(local_path):
                 os.makedirs(target_dir, exist_ok=True)
@@ -151,7 +203,29 @@ class family_handler:
 
     @staticmethod
     def set_cache_parameters(cache_type, base_model_type, model_def, inputs, skip_steps_cache):
-        pass
+        return
+
+    @staticmethod
+    def validate_generative_settings(base_model_type, model_def, inputs):
+        image_mode = inputs.get("image_mode", 0)
+        image_prompt_type = inputs.get("image_prompt_type", "") or ""
+        if image_mode > 0 and any(letter in image_prompt_type for letter in "TVEL"):
+            return "Anima image generation only supports Start Image prompt type 'S'."
+
+        model_mode = inputs.get("model_mode", 0)
+        model_mode_int = None
+        if model_mode is not None:
+            try:
+                model_mode_int = int(model_mode)
+            except (TypeError, ValueError):
+                model_mode_int = None
+
+        if image_mode == 2 and model_mode_int == 1:
+            activated_loras = inputs.get("activated_loras", []) or []
+            if len(activated_loras) == 0:
+                return "Anima LoRA Inpainting mode requires at least one active LoRA."
+
+        return None
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
@@ -159,7 +233,10 @@ class family_handler:
             {
                 "guidance_scale": 4,
                 "num_inference_steps": 30,
-                "flow_shift": 1.0,
+                "flow_shift": 3.0,
                 "sample_solver": "er_sde",
+                "denoising_strength": 1.0,
+                "masking_strength": 0.25,
+                "model_mode": 0,
             }
         )

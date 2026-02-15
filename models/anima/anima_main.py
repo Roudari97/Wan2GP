@@ -5,13 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from accelerate import init_empty_weights
-from diffusers import (
-    FlowMatchEulerDiscreteScheduler,
-    EulerDiscreteScheduler,
-    EulerAncestralDiscreteScheduler,
-    DPMSolverMultistepScheduler,
-    UniPCMultistepScheduler,
-)
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from mmgp import offload
 from shared.utils import files_locator as fl
@@ -68,6 +62,85 @@ class model_factory:
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
+
+    @staticmethod
+    def _to_image_tensor(image_like, device):
+        if image_like is None:
+            return None
+
+        if isinstance(image_like, (list, tuple)):
+            if len(image_like) == 0:
+                return None
+            image_like = image_like[0]
+
+        if not torch.is_tensor(image_like):
+            return None
+
+        x = image_like
+        if x.ndim == 5:  # [B, C, T, H, W]
+            x = x[0, :, 0]
+        elif x.ndim == 4:
+            if x.shape[0] in (1, 3, 4):  # [C, T, H, W]
+                x = x[:, 0]
+            elif x.shape[1] in (1, 3, 4):  # [B, C, H, W]
+                x = x[0]
+            else:
+                x = x[0]
+        elif x.ndim != 3:
+            return None
+
+        if x.shape[0] not in (1, 3, 4):
+            return None
+
+        if x.shape[0] == 1:
+            x = x.repeat(3, 1, 1)
+        elif x.shape[0] == 4:
+            x = x[:3]
+
+        x = x.to(device=device, dtype=torch.float32)
+        if x.min() >= 0.0 and x.max() > 1.0:
+            x = x / 255.0
+        if x.min() >= 0.0:
+            x = x * 2.0 - 1.0
+        return x.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _to_mask_tensor(mask_like, device):
+        if mask_like is None:
+            return None
+
+        if isinstance(mask_like, (list, tuple)):
+            if len(mask_like) == 0:
+                return None
+            mask_like = mask_like[0]
+
+        if not torch.is_tensor(mask_like):
+            return None
+
+        x = mask_like
+        if x.ndim == 5:  # [B, C, T, H, W]
+            x = x[0, 0, 0]
+        elif x.ndim == 4:
+            if x.shape[1] == 1:  # [B, 1, H, W]
+                x = x[0, 0]
+            elif x.shape[0] == 1:  # [1, T, H, W]
+                x = x[0, 0]
+            else:
+                x = x[0, 0]
+        elif x.ndim == 3:
+            if x.shape[0] in (1, 3):
+                x = x[0]
+            else:
+                x = x[0]
+        elif x.ndim != 2:
+            return None
+
+        x = x.to(device=device, dtype=torch.float32)
+        if x.min() >= 0.0 and x.max() > 1.0:
+            x = x / 255.0
+        if x.min() < 0.0:
+            x = (x + 1.0) * 0.5
+        return torch.where(x >= 0.5, 1.0, 0.0)
 
     def __init__(
         self,
@@ -173,7 +246,7 @@ class model_factory:
 
         # T5 tokenizer for the LLMAdapter embedding (vocab_size=32128)
         try:
-            t5_tokenizer = T5TokenizerFast.from_pretrained("google/t5-v1_1-xxl")
+            t5_tokenizer = T5TokenizerFast.from_pretrained("google/t5-v1_1-xxl", legacy=False)
         except Exception as exc:
             raise RuntimeError(
                 f"[Anima] Failed to load T5-v1.1-XXL tokenizer: {exc}. "
@@ -278,47 +351,6 @@ class model_factory:
 
         return hidden_states, t5_ids
 
-    def _get_scheduler(self, sample_solver, shift=1.0):
-        """Create scheduler based on solver name. Supports ComfyUI-style sampler names."""
-        solver = sample_solver.lower().strip() if sample_solver else "default"
-
-        if solver in ("default", "er_sde", "euler", ""):
-            return FlowMatchEulerDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=1.0,
-                base_shift=0.5,
-                max_shift=0.9,
-                base_image_seq_len=256,
-                max_image_seq_len=4096,
-                use_dynamic_shifting=True,
-                time_shift_type="exponential",
-                shift_terminal=0.02,
-            )
-        elif solver in ("euler_a", "euler_ancestral"):
-            return EulerAncestralDiscreteScheduler(
-                num_train_timesteps=1000,
-            )
-        elif solver in ("dpmpp_2m_sde", "dpmpp_2m_sde_gpu"):
-            return DPMSolverMultistepScheduler(
-                num_train_timesteps=1000,
-                algorithm_type="sde-dpmsolver++",
-            )
-        elif solver == "unipc":
-            return UniPCMultistepScheduler(
-                num_train_timesteps=1000,
-            )
-        elif solver == "dpmpp_2m":
-            return DPMSolverMultistepScheduler(
-                num_train_timesteps=1000,
-                algorithm_type="dpmsolver++",
-            )
-        else:
-            logger.warning(f"[Anima] Unknown solver '{sample_solver}', using default (flow match euler)")
-            return FlowMatchEulerDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=shift,
-            )
-
     def generate(
         self,
         seed=None,
@@ -337,6 +369,21 @@ class model_factory:
         **kwargs,
     ):
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        loras_slists = kwargs.get("loras_slists")
+        try:
+            shift = float(shift)
+        except (TypeError, ValueError):
+            shift = 3.0
+        if shift <= 0:
+            shift = 3.0
+        denoising_strength = float(kwargs.get("denoising_strength", 1.0))
+        masking_strength = float(kwargs.get("masking_strength", 1.0))
+        denoising_strength = max(0.0, min(1.0, denoising_strength))
+        masking_strength = max(0.0, min(1.0, masking_strength))
+
+        input_frames = kwargs.get("input_frames")
+        image_start = kwargs.get("image_start")
+        input_masks = kwargs.get("input_masks")
 
         if self._interrupt:
             return None
@@ -400,8 +447,61 @@ class model_factory:
         # Keep latents in float32 for stable Euler updates; cast to model dtype only for forward.
         latents = torch.randn(latent_shape, generator=generator, device=device, dtype=torch.float32)
 
+        source_latents = None
+        image_mask_latents = None
+        randn = None
+        masked_steps = 0
+
+        init_image = self._to_image_tensor(input_frames, device)
+        if init_image is None:
+            init_image = self._to_image_tensor(image_start, device)
+
+        if init_image is not None:
+            init_image = F.interpolate(
+                init_image.unsqueeze(0),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).unsqueeze(2)
+
+            vae_dtype = next(self.vae.parameters()).dtype
+            with torch.no_grad():
+                posterior = self.vae.encode(init_image.to(dtype=vae_dtype), return_dict=True).latent_dist
+                z = posterior.sample().to(dtype=torch.float32)
+
+            vae_z_dim = self.vae.config.z_dim
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, vae_z_dim, 1, 1, 1)
+                .to(z.device, z.dtype)
+            )
+            latents_std = (
+                torch.tensor(self.vae.config.latents_std)
+                .view(1, vae_z_dim, 1, 1, 1)
+                .to(z.device, z.dtype)
+            )
+            source_latents = (z - latents_mean) / latents_std
+            source_latents = F.interpolate(
+                source_latents.squeeze(2),
+                size=(latent_h, latent_w),
+                mode="bilinear",
+                align_corners=False,
+            ).unsqueeze(2)
+
+            if source_latents.shape[0] != batch_size:
+                source_latents = source_latents.repeat(batch_size, 1, 1, 1, 1)
+
+            mask_2d = self._to_mask_tensor(input_masks, device)
+            if mask_2d is not None:
+                image_mask_latents = F.interpolate(
+                    mask_2d.unsqueeze(0).unsqueeze(0),
+                    size=(latent_h, latent_w),
+                    mode="nearest",
+                ).unsqueeze(2)
+                image_mask_latents = image_mask_latents.repeat(batch_size, 1, 1, 1, 1)
+
         # Build sigma schedule matching ComfyUI: ModelSamplingDiscreteFlow with shift=3.0, multiplier=1.0
-        SHIFT = 3.0
+        SHIFT = shift
         MULTIPLIER = 1.0
         num_internal = 1000
         def time_snr_shift(alpha, t):
@@ -419,6 +519,22 @@ class model_factory:
         sigmas_list.append(0.0)
         sigmas = torch.tensor(sigmas_list, device=device)
         num_steps = sampling_steps
+
+        if source_latents is not None:
+            first_step = int(round(num_steps * (1.0 - denoising_strength), 4)) if denoising_strength < 1.0 else 0
+            first_step = min(max(first_step, 0), max(num_steps - 1, 0))
+            randn = torch.randn(latent_shape, generator=generator, device=device, dtype=torch.float32)
+            if denoising_strength < 1.0 and len(sigmas) > 1:
+                sigma_start = sigmas[first_step]
+                latents = source_latents * (1.0 - sigma_start) + randn * sigma_start
+                sigmas = sigmas[first_step:]
+                num_steps = max(len(sigmas) - 1, 0)
+            masked_steps = int(np.ceil(num_steps * masking_strength)) if image_mask_latents is not None else 0
+
+        if loras_slists is not None:
+            from shared.utils.loras_mutipliers import update_loras_slists
+
+            update_loras_slists(self.transformer, loras_slists, num_steps)
 
         # --- Sampler selection ---
         solver = sample_solver.lower().strip() if sample_solver else "er_sde"
@@ -446,7 +562,8 @@ class model_factory:
             point_indice = torch.arange(0, num_integration_points, dtype=torch.float32, device=device)
 
         logger.info(f"[Anima] Denoising: {num_steps} steps, CFG={guide_scale}, sampler={solver}, shift={SHIFT}")
-        callback(-1, None, True, override_num_inference_steps=sampling_steps)
+        if callback is not None:
+            callback(-1, None, True, override_num_inference_steps=num_steps)
 
         # Pre-compute CFG context (same every step)
         if do_cfg and negative_embeds is not None:
@@ -544,6 +661,10 @@ class model_factory:
 
             old_denoised = denoised
 
+            if image_mask_latents is not None and source_latents is not None and i < masked_steps:
+                noisy_source = source_latents if sigma_next <= 0 else randn * sigma_next + (1.0 - sigma_next) * source_latents
+                latents = noisy_source * (1.0 - image_mask_latents) + image_mask_latents * latents
+
             if callback is not None:
                 callback(i, latents[0, :, :1], False)
 
@@ -581,7 +702,29 @@ class model_factory:
         return {"x": result}
 
     def get_loras_transformer(self, *args, **kwargs):
-        return [], []
+        get_model_recursive_prop = kwargs.get("get_model_recursive_prop")
+        model_type = kwargs.get("model_type")
+        model_mode = kwargs.get("model_mode")
+        image_mode = kwargs.get("image_mode")
+
+        if get_model_recursive_prop is None:
+            return [], []
+        if image_mode != 2:
+            return [], []
+
+        model_mode_int = None
+        if model_mode is not None:
+            try:
+                model_mode_int = int(model_mode)
+            except (TypeError, ValueError):
+                model_mode_int = None
+        if model_mode_int != 1:
+            return [], []
+
+        preloadURLs = get_model_recursive_prop(model_type, "preload_URLs")
+        if len(preloadURLs) == 0:
+            return [], []
+        return [fl.locate_file(os.path.basename(preloadURLs[0]))], [1]
 
     @property
     def _interrupt(self):

@@ -709,6 +709,55 @@ class AnimaModel(MiniTrainDIT):
         super().__init__(*args, **kwargs)
         self.llm_adapter = LLMAdapter()
 
+    def preprocess_loras(self, model_type, sd):
+        if not sd:
+            return sd
+
+        # Normalize common LoRA key variants.
+        normalized_sd = {}
+        for key, value in sd.items():
+            key = key.replace(".default.", ".")
+            key = key.replace(".lora.down.weight", ".lora_down.weight")
+            key = key.replace(".lora.up.weight", ".lora_up.weight")
+            key = key.replace(".lora.", ".lora_")
+            normalized_sd[key] = value
+        sd = normalized_sd
+
+        converted = {}
+        for key, value in sd.items():
+            # Ignore text-encoder-only LoRA branches when loading transformer LoRAs.
+            if key.startswith("lora_te_") or key.startswith("lora_text_encoder_"):
+                continue
+
+            if key.startswith("lora_unet_blocks_"):
+                suffix = key[len("lora_unet_blocks_") :]
+                block_idx, sep, block_key = suffix.partition("_")
+                if not sep or not block_idx.isdigit():
+                    continue
+
+                # Convert common Diffusers/Comfy block naming to Anima module names.
+                block_key = block_key.replace("self_attn_", "self_attn.")
+                block_key = block_key.replace("cross_attn_", "cross_attn.")
+                block_key = block_key.replace("layer_norm_self_attn_", "layer_norm_self_attn.")
+                block_key = block_key.replace("layer_norm_cross_attn_", "layer_norm_cross_attn.")
+                block_key = block_key.replace("layer_norm_mlp_", "layer_norm_mlp.")
+                block_key = block_key.replace("mlp_fc1", "mlp.layer1")
+                block_key = block_key.replace("mlp_fc2", "mlp.layer2")
+                block_key = block_key.replace("mlp_up_proj", "mlp.layer1")
+                block_key = block_key.replace("mlp_gate_proj", "mlp.layer1")
+                block_key = block_key.replace("mlp_down_proj", "mlp.layer2")
+                block_key = block_key.replace("mlp_", "mlp.")
+                converted[f"diffusion_model.blocks.{block_idx}.{block_key}"] = value
+                continue
+
+            if key.startswith("blocks.") and not key.startswith("diffusion_model."):
+                converted[f"diffusion_model.{key}"] = value
+                continue
+
+            converted[key] = value
+
+        return converted
+
     def preprocess_text_embeds(self, text_embeds, text_ids):
         if text_ids is not None:
             return self.llm_adapter(text_embeds, text_ids)

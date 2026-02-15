@@ -1,0 +1,9 @@
+{
+    "num_inference_steps": 30,
+    "guidance_scale": 4,
+    "sample_solver": "er_sde",
+    "flow_shift": 3.0,
+    "denoising_strength": 1.0,
+    "masking_strength": 0.25,
+    "model_mode": 0
+}
