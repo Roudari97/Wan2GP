@@ -238,5 +238,11 @@ class family_handler:
                 "denoising_strength": 1.0,
                 "masking_strength": 0.25,
                 "model_mode": 0,
+                "image_prompt_type": "",
             }
         )
+
+    @staticmethod
+    def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
+        # Anima should not persist/start in queue-video image prompt mode across model switches.
+        ui_defaults["image_prompt_type"] = ""
