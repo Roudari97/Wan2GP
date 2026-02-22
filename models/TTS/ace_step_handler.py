@@ -118,7 +118,8 @@ ACE_STEP15_MODEL_MODES = {
         ("Generate Audio Codes based on Lyrics for better Semantic Understanding", 0),
         ("+ Compute empty Bpm, Keyscale, Time Signature, Language using Lyrics & Music Caption", 1),
         ("++ Refine Caption", 2),
-        ("+++ Determine Best Song Duration based on Lyrics & Music Caption", 3),
+        ("++ Determine Best Song Duration based on Lyrics & Music Caption", 4),
+        ("+++ Refine Caption & Determine Best Song Duration based on Lyrics & Music Caption", 3),
     ],
     "default": 0,
     "label": "LM Chain Of Thought Preprocessing",
@@ -292,12 +293,15 @@ class family_handler:
                 "text_encoder_folder": _get_model_path(model_def, "text_encoder_folder", ACE_STEP15_LM_FOLDER),
                 "inference_steps": True,
                 "temperature": True,
+                "top_p_slider": True,
+                "top_k_slider": True,
                 "any_audio_prompt": True,
                 "audio_guide_label": "Source Audio",
                 "audio_guide2_label": "Reference Timbre",
                 "audio_scale_name": "Source Audio Strength",
                 "audio_prompt_choices": True,
                 "enabled_audio_lora": True,
+                "lm_engines": ["vllm"],
                 "prompt_class": "Lyrics",
                 "prompt_description": "Lyrics / Prompt (Write [Instrumental] for Instrumental Generation only)",
                 "audio_prompt_type_sources": {
@@ -488,7 +492,6 @@ class family_handler:
             lm_weights = text_encoder_filename
             lm_tokenizer_dir = _get_model_path(model_def, "ace_step15_lm_tokenizer_dir", _ace_step15_lm_ckpt_dir(lm_folder))
             silence_latent = _get_model_path(model_def, "ace_step15_silence_latent", _ace_step15_ckpt_file(ACE_STEP15_SILENCE_LATENT_NAME))
-            lm_vllm_weight_mode = _get_model_path(model_def, "ace_step15_vllm_weight_mode", "lazy")
             if enable_lm:
                 lm_weight_name = os.path.basename(str(lm_weights)) if lm_weights else ""
                 print(f"[ace_step15] LM engine='{lm_decoder_engine}' | LM weights='{lm_weight_name}'")
@@ -506,7 +509,6 @@ class family_handler:
                 enable_lm=enable_lm,
                 ignore_lm_cache_seed=ignore_lm_cache_seed,
                 lm_decoder_engine=lm_decoder_engine,
-                lm_vllm_weight_mode=lm_vllm_weight_mode,
                 dtype=dtype or torch.bfloat16,
             )
 
@@ -515,8 +517,10 @@ class family_handler:
                 "text_encoder_2": pipeline.text_encoder_2,
                 "codec": pipeline.audio_vae,
             }
-            if lm_decoder_engine != "vllm" and text_encoder_filename and pipeline.lm_model is not None:
+            if text_encoder_filename and pipeline.lm_model is not None:
                 pipe["text_encoder"] = pipeline.lm_model
+
+            pipe = { "pipe": pipe, "coTenantsMap": {}, }
 
             if save_quantized and transformer_weights:
                 from wgp import save_quantized_model
@@ -588,6 +592,8 @@ class family_handler:
                     "num_inference_steps": 8,
                     "negative_prompt": "",
                     "temperature": 1.0,
+                    "top_p": 0.9,
+                    "top_k": 0,
                     "guidance_scale": 1.0,
                     "multi_prompts_gen_type": 2,
                     "audio_scale": 0.5,
@@ -627,6 +633,13 @@ class family_handler:
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
         if _is_ace_step15(base_model_type):
+            if settings_version < 2.51:
+                # ACE-Step 1.5 implicit LM defaults are: top-p 0.9, top-k disabled.
+                ui_defaults["top_p"] = 0.9
+                ui_defaults["top_k"] = 0
+            else:
+                ui_defaults.setdefault("top_p", 0.9)
+                ui_defaults.setdefault("top_k", 0)
             return
         if ui_defaults.get("sample_solver", "") in ("", None):
             legacy_scheduler = ui_defaults.get("scheduler_type", "")
