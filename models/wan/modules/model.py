@@ -1041,6 +1041,8 @@ class WanModel(ModelMixin, ConfigMixin):
                  lynx=None,
                  steadydancer = False,
                  scail = False,
+                 any_kiwi_source = False,
+                 any_kiwi_ref = False,
                  ):
 
         super().__init__()
@@ -1070,6 +1072,8 @@ class WanModel(ModelMixin, ConfigMixin):
         self.audio_window = audio_window
         self.intermediate_dim = intermediate_dim
         self.vae_scale = vae_scale
+        self.any_kiwi_source = any_kiwi_source
+        self.any_kiwi_ref = any_kiwi_ref
 
         multitalk = multitalk_output_dim > 0
         self.multitalk = multitalk
@@ -1442,7 +1446,7 @@ class WanModel(ModelMixin, ConfigMixin):
         real_step_no = 0,
         x_id= 0,
         max_steps = 0, 
-        slg_layers=None,
+        perturbation_layers=None,
         callback = None,
         cam_emb: torch.Tensor = None,
         fps = None,
@@ -1468,6 +1472,9 @@ class WanModel(ModelMixin, ConfigMixin):
         steadydancer_ref_c = None,
         steadydancer_clip_fea_c = None,
         scail_pose_latents = None,
+        kiwi_source_condition = None,
+        kiwi_ref_condition = None,
+        kiwi_ref_pad_first = False,
     ):
         # patch_dtype =  self.patch_embedding.weight.dtype
         modulation_dtype = self.time_projection[1].weight.dtype
@@ -1484,6 +1491,7 @@ class WanModel(ModelMixin, ConfigMixin):
             voxel_shape = (4, 6, 8)
         real_seq = 0
         x_list = x
+        output_slice = None
         joint_pass = len(x_list) > 1
         is_source_x = [ x.data_ptr() == x_list[0].data_ptr() and i > 0 for i, x in enumerate(x_list) ]
         last_x_idx  = 0
@@ -1509,6 +1517,26 @@ class WanModel(ModelMixin, ConfigMixin):
                 # embeddings
                 if not steadydancer:
                     x = self.patch_embedding(x).to(modulation_dtype)
+                    if kiwi_source_condition is not None:
+                        source_cond = kiwi_source_condition.to(modulation_dtype)
+                        if source_cond.shape[2:] != x.shape[2:]:
+                            source_cond_full = torch.zeros_like(x)
+                            t_len = min(source_cond.shape[2], x.shape[2])
+                            source_cond_full[:, :, :t_len] = source_cond[:, :, :t_len] 
+                            source_cond = source_cond_full
+                        sigma = (t.flatten()[0] if t.numel() > 0 else 1000.0) / 1000.0
+                        sigma = sigma.to(device=x.device, dtype=modulation_dtype)
+                        x += source_cond * sigma
+                    if kiwi_ref_condition is not None:
+                        ref_cond = kiwi_ref_condition.to(modulation_dtype)
+                        real_latent_frames = int(x.shape[2])
+                        ref_latent_frames = int(ref_cond.shape[2])
+                        if kiwi_ref_pad_first:
+                            output_slice = slice(ref_latent_frames, ref_latent_frames + real_latent_frames)
+                            x = torch.cat([ref_cond, x], dim=2)
+                        else:
+                            output_slice = slice(0, real_latent_frames)
+                            x = torch.cat([x, ref_cond], dim=2)
                     grid_sizes = x.shape[2:]
                 x_list[i] = x
         y = y_list = None
@@ -1632,8 +1660,8 @@ class WanModel(ModelMixin, ConfigMixin):
             else:
                 e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim))
 
-        # context
-        context = [self.text_embedding( u ) for u in context  ] 
+        if not (self.any_kiwi_source or self.any_kiwi_ref):
+            context = [self.text_embedding(u) for u in context]
         
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
@@ -1770,7 +1798,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     if not standin_cache_enabled: get_cache("standin").clear()
                     standin_x = block(standin_x, context = None, grid_sizes = None, e= standin_e0, freqs = standin_freqs, standin_phase = 1)
 
-                if slg_layers is not None and block_idx in slg_layers:
+                if perturbation_layers is not None and block_idx in perturbation_layers:
                     if x_id != 0 or not x_should_calc[0]:
                         continue
                     x_list[0] = block(x_list[0], context = context_list[0], audio_scale= audio_scale_list[0], e= e0, **kwargs)
@@ -1815,9 +1843,12 @@ class WanModel(ModelMixin, ConfigMixin):
             x = self.head(x, e)
 
             # unpatchify
-            x_list[i] = self.unpatchify(x, grid_sizes)
+            x = self.unpatchify(x, grid_sizes)
             if real_seq > 0:
                 x = x[:, :real_seq]
+            if output_slice is not None:
+                x = x[:, :, output_slice]
+            x_list[i] = x
             del x
 
         return [x.float() for x in x_list]

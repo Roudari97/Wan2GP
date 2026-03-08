@@ -7,35 +7,97 @@ _GEMMA_FOLDER_URL = "https://huggingface.co/DeepBeepMeep/LTX-2/resolve/main/gemm
 _GEMMA_FOLDER = "gemma-3-12b-it-qat-q4_0-unquantized"
 _GEMMA_FILENAME = f"{_GEMMA_FOLDER}.safetensors"
 _GEMMA_QUANTO_FILENAME = f"{_GEMMA_FOLDER}_quanto_bf16_int8.safetensors"
-_SPATIAL_UPSCALER_FILENAME = "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-_DISTILLED_LORA_FILENAME = "ltx-2-19b-distilled-lora-384.safetensors"
-_VIDEO_VAE_FILENAME = "ltx-2-19b_vae.safetensors"
-_AUDIO_VAE_FILENAME = "ltx-2-19b_audio_vae.safetensors"
-_VOCODER_FILENAME = "ltx-2-19b_vocoder.safetensors"
-_TEXT_EMBEDDING_PROJECTION_FILENAME = "ltx-2-19b_text_embedding_projection.safetensors"
-_DEV_EMBEDDINGS_CONNECTOR_FILENAME = "ltx-2-19b-dev_embeddings_connector.safetensors"
-_DISTILLED_EMBEDDINGS_CONNECTOR_FILENAME = "ltx-2-19b-distilled_embeddings_connector.safetensors"
+
+_ARCH_SPECS = {
+    "ltx2_19B": {
+        "repo_id": "DeepBeepMeep/LTX-2",
+        "config_file": "ltx2_19b_config.json",
+        "spatial_upscaler": "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+        "temporal_upscaler": "ltx-2-temporal-upscaler-x2-1.0.safetensors",
+        "distilled_lora": "ltx-2-19b-distilled-lora-384.safetensors",
+        "video_vae": "ltx-2-19b_vae.safetensors",
+        "audio_vae": "ltx-2-19b_audio_vae.safetensors",
+        "vocoder": "ltx-2-19b_vocoder.safetensors",
+        "text_embedding_projection": "ltx-2-19b_text_embedding_projection.safetensors",
+        "dev_embeddings_connector": "ltx-2-19b-dev_embeddings_connector.safetensors",
+        "distilled_embeddings_connector": "ltx-2-19b-distilled_embeddings_connector.safetensors",
+        "profiles_dir": "ltx2_19B",
+        "lora_dir": "ltx2",
+    },
+    "ltx2_22B": {
+        "repo_id": "DeepBeepMeep/LTX-2",
+        "config_file": "ltx2_22b_config.json",
+        "spatial_upscaler": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+        "temporal_upscaler": "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+        "distilled_lora": "ltx-2.3-22b-distilled-lora-384.safetensors",
+        "union_control_lora": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+        "video_vae": "ltx-2.3-22b_vae.safetensors",
+        "audio_vae": "ltx-2.3-22b_audio_vae.safetensors",
+        "vocoder": "ltx-2.3-22b_vocoder.safetensors",
+        "text_embedding_projection": "ltx-2.3-22b_text_embedding_projection.safetensors",
+        "embeddings_connector": "ltx-2.3-22b_embeddings_connector.safetensors",
+        "profiles_dir": "ltx2_22B",
+        "lora_dir": "ltx2_22B",
+    },
+}
 
 
-def _get_embeddings_connector_filename(model_def):
-    pipeline_kind = (model_def or {}).get("ltx2_pipeline", "two_stage")
-    if pipeline_kind == "distilled":
-        return _DISTILLED_EMBEDDINGS_CONNECTOR_FILENAME
-    return _DEV_EMBEDDINGS_CONNECTOR_FILENAME
+def _get_arch_spec(base_model_type: str | None) -> dict:
+    return _ARCH_SPECS.get(base_model_type or "", _ARCH_SPECS["ltx2_19B"])
 
 
-def _get_multi_file_names(model_def):
+def _default_perturbation_layers(base_model_type: str | None) -> list[int]:
+    return [28] if base_model_type == "ltx2_22B" else [29]
+
+
+def _default_dev_settings(base_model_type: str | None) -> dict:
     return {
-        "video_vae": _VIDEO_VAE_FILENAME,
-        "audio_vae": _AUDIO_VAE_FILENAME,
-        "vocoder": _VOCODER_FILENAME,
-        "text_embedding_projection": _TEXT_EMBEDDING_PROJECTION_FILENAME,
-        "text_embeddings_connector": _get_embeddings_connector_filename(model_def),
+        "num_inference_steps": 30 if base_model_type == "ltx2_22B" else 40,
+        "guidance_scale": 3.0,
+        # "audio_guidance_scale": 7.0,
+        # "alt_guidance_scale": 3.0,
+        # "alt_scale": 0.7,
+        # "perturbation_switch": 2,
+        "perturbation_layers": _default_perturbation_layers(base_model_type),
+        "perturbation_start_perc": 0,
+        "perturbation_end_perc": 100,
+        "apg_switch": 0,
+        "cfg_star_switch": 0,
+        "guidance_phases": 2,
     }
 
 
-def _resolve_multi_file_paths(model_def):
-    return {key: fl.locate_file(name) for key, name in _get_multi_file_names(model_def).items()}
+def _get_embeddings_connector_filename(model_def, base_model_type):
+    spec = _get_arch_spec(base_model_type)
+    shared_connector = spec.get("embeddings_connector")
+    if shared_connector:
+        return shared_connector
+    pipeline_kind = (model_def or {}).get("ltx2_pipeline", "two_stage")
+    if pipeline_kind == "distilled":
+        return spec["distilled_embeddings_connector"]
+    return spec["dev_embeddings_connector"]
+
+
+def _get_multi_file_names(model_def, base_model_type):
+    spec = _get_arch_spec(base_model_type)
+    return {
+        "video_vae": spec["video_vae"],
+        "audio_vae": spec["audio_vae"],
+        "vocoder": spec["vocoder"],
+        "text_embedding_projection": spec["text_embedding_projection"],
+        "text_embeddings_connector": _get_embeddings_connector_filename(model_def, base_model_type),
+    }
+
+
+def _resolve_multi_file_paths(model_def, base_model_type):
+    spec = _get_arch_spec(base_model_type)
+    paths = {key: fl.locate_file(name) for key, name in _get_multi_file_names(model_def, base_model_type).items()}
+    paths["spatial_upsampler"] = fl.locate_file(spec["spatial_upscaler"])
+    model_config = os.path.join(os.path.dirname(__file__), "configs", spec["config_file"])
+    if not os.path.isfile(model_config):
+        raise FileNotFoundError(f"Missing LTX config file: {model_config}")
+    paths["model_config"] = model_config
+    return paths
 
 
 
@@ -43,7 +105,7 @@ def _resolve_multi_file_paths(model_def):
 class family_handler:
     @staticmethod
     def query_supported_types():
-        return ["ltx2_19B"]
+        return ["ltx2_19B", "ltx2_22B"]
 
     @staticmethod
     def query_family_maps():
@@ -59,9 +121,17 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
+        spec = _get_arch_spec(base_model_type)
         pipeline_kind = model_def.get("ltx2_pipeline", "two_stage")
 
         distilled = pipeline_kind == "distilled"
+        audio_prompt_selection = ["", "A", "K"] if distilled else ["", "A"]
+        audio_prompt_labels = {
+            "": "Generate Video & Soundtrack based on Text Prompt",
+            "A": "Generate Video based on Soundtrack and Text Prompt",
+        }
+        if distilled:
+            audio_prompt_labels["K"] = "Generate Video based on Control Video + its Audio Track and Text Prompt"
 
         extra_model_def = {
             "text_encoder_folder": _GEMMA_FOLDER,
@@ -82,33 +152,31 @@ class family_handler:
             "audio_guide_label": "Audio Prompt (Soundtrack)",
             "audio_scale_name": "Prompt Audio Strength",
             "audio_prompt_type_sources": {
-                "selection": ["", "A", "K"],
-                "labels": {
-                    "": "Generate Video & Soundtrack based on Text Prompt",
-                    "A": "Generate Video based on Soundtrack and Text Prompt",
-                    "K": "Generate Video based on Control Video + its Audio Track and Text Prompt",
-                },
+                "selection": audio_prompt_selection,
+                "labels": audio_prompt_labels,
                 "show_label": False,
             },
             "audio_guide_window_slicing": True,
             "output_audio_is_input_audio": True,
-            "custom_denoising_strength": True,
-            "profiles_dir": ["ltx2_19B"],
+            "custom_denoising_strength": distilled,
+            "profiles_dir": [spec["profiles_dir"]],
+            "ltx2_spatial_upscaler_file": spec["spatial_upscaler"],
             "self_refiner": True,
             "self_refiner_max_plans": 2,
         }
         extra_model_def["extra_control_frames"] = 1
         extra_model_def["dont_cat_preguide"] = True
         extra_model_def["input_video_strength"] = "Image / Source Video Strength (you may try values lower value than 1 to get more motion)"
-        extra_model_def["guide_preprocessing"] = {
-            "selection": ["", "PVG", "DVG", "EVG", "VG"],
-            "labels": {
-                "PVG": "Transfer Human Motion",
-                "DVG": "Transfer Depth",
-                "EVG": "Transfer Canny Edges",
-                "VG": "Use LTX-2 raw format",
-            },
-        }
+        if distilled:
+            extra_model_def["guide_preprocessing"] = {
+                "selection": ["", "PVG", "DVG", "EVG", "VG"],
+                "labels": {
+                    "PVG": "Transfer Human Motion",
+                    "DVG": "Transfer Depth",
+                    "EVG": "Transfer Canny Edges",
+                    "VG": "Use LTX-2 raw format",
+                },
+            }
         extra_model_def["mask_preprocessing"] = {
             "selection": ["", "A", "NA", "XA", "XNA"],
         }
@@ -132,10 +200,18 @@ class family_handler:
         else:
             extra_model_def.update(
                 {
+                    "audio_guidance": True,
                     "adaptive_projected_guidance": True,
                     "cfg_star": True,
-                    "skip_layer_guidance": True,
+                    "perturbation": True,
                     "alt_guidance": "Modality Guidance",
+                    "alt_scale": "Guidance Rescale",
+                    "perturbation_choices": [
+                        ("Off", 0),
+                        ("Skip Layer Guidance", 1),
+                        ("Skip Self Attention", 2),
+                    ],
+                    "perturbation_layers_max": 48,
                 }
             )
         extra_model_def["guidance_max_phases"] = 2
@@ -147,7 +223,7 @@ class family_handler:
     def get_rgb_factors(base_model_type):
         from shared.RGB_factors import get_rgb_factors
 
-        return get_rgb_factors("ltx2")
+        return get_rgb_factors("ltx2", base_model_type)
 
     @staticmethod
     def register_lora_cli_args(parser, lora_root):
@@ -157,9 +233,17 @@ class family_handler:
             default=None,
             help=f"Path to a directory that contains LTX-2 LoRAs (default: {os.path.join(lora_root, 'ltx2')})",
         )
+        # parser.add_argument(
+        #     "--lora-dir-ltx2-22b",
+        #     type=str,
+        #     default=None,
+        #     help=f"Path to a directory that contains LTX-2.3 22B LoRAs (default: {os.path.join(lora_root, 'ltx2_22B')})",
+        # )
 
     @staticmethod
     def get_lora_dir(base_model_type, args, lora_root):
+        # if base_model_type == "ltx2_22B":
+        #     return getattr(args, "lora_dir_ltx2_22b", None) or os.path.join(lora_root, "ltx2_22B")
         return getattr(args, "lora_dir_ltx2", None) or os.path.join(lora_root, "ltx2")
 
     @staticmethod
@@ -168,6 +252,7 @@ class family_handler:
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
+        spec = _get_arch_spec(base_model_type)
         gemma_files = [
             "added_tokens.json",
             "chat_template.json",
@@ -179,16 +264,16 @@ class family_handler:
             "tokenizer.json",
             "tokenizer.model",
             "tokenizer_config.json",
-        ] 
+        ]
 
-        file_list = [_SPATIAL_UPSCALER_FILENAME] 
-        for name in _get_multi_file_names(model_def).values():
+        file_list = [spec["spatial_upscaler"], spec["temporal_upscaler"]]
+        for name in _get_multi_file_names(model_def, base_model_type).values():
             if name not in file_list:
                 file_list.append(name)
 
         download_def = [
             {
-                "repoId": "DeepBeepMeep/LTX-2",
+                "repoId": spec["repo_id"],
                 "sourceFolderList": [""],
                 "fileList": [file_list],
             },
@@ -226,8 +311,8 @@ class family_handler:
     ):
         from .ltx2 import LTX2
 
-        checkpoint_paths = _resolve_multi_file_paths(model_def)
-        transformer_path = model_filename[0] if isinstance(model_filename, (list, tuple)) else model_filename
+        checkpoint_paths = _resolve_multi_file_paths(model_def, base_model_type)
+        transformer_path = list(model_filename) if isinstance(model_filename, (list, tuple)) else model_filename
         checkpoint_paths["transformer"] = transformer_path
 
         ltx2_model = LTX2(
@@ -241,6 +326,19 @@ class family_handler:
             text_encoder_filepath = model_def.get("text_encoder_folder", os.path.dirname(text_encoder_filename)),
             checkpoint_paths=checkpoint_paths,
         )
+
+        if save_quantized:
+            from wgp import save_quantized_model
+
+            quantized_source = transformer_path[0] if isinstance(transformer_path, (list, tuple)) else transformer_path
+            quantized_transformer = getattr(ltx2_model.model, "velocity_model", ltx2_model.model)
+            save_quantized_model(
+                quantized_transformer,
+                model_type,
+                quantized_source,
+                dtype,
+                checkpoint_paths["model_config"],
+            )
 
         pipe = {
             "transformer": ltx2_model.model,
@@ -264,6 +362,7 @@ class family_handler:
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
+        default_perturbation_layers = _default_perturbation_layers(base_model_type)
         pipeline_kind = model_def.get("ltx2_pipeline", "two_stage")
         if pipeline_kind != "distilled" and ui_defaults.get("guidance_phases", 0) < 2:
             ui_defaults["guidance_phases"] = 2
@@ -280,7 +379,7 @@ class family_handler:
             ui_defaults.update(
                 {
                     "alt_guidance_scale": 1.0,
-                    "slg_layers": [29],
+                    "perturbation_layers": default_perturbation_layers,
                 }
             )
 
@@ -291,6 +390,15 @@ class family_handler:
                 }
             )
 
+        if settings_version < 2.55 and pipeline_kind != "distilled":
+            ui_defaults.update({
+                "audio_guidance_scale": 1.0,
+                "alt_guidance_scale": 1.0,
+                "alt_scale": 0.0,
+                })
+
+                # _default_dev_settings(base_model_type)
+
         if settings_version < 2.52:
             plan = ui_defaults.get("self_refiner_plan")
             if isinstance(plan, list):
@@ -299,6 +407,7 @@ class family_handler:
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
+        default_perturbation_layers = _default_perturbation_layers(base_model_type)
         ui_defaults.update(
             {
                 "sliding_window_size": 481,
@@ -306,14 +415,12 @@ class family_handler:
                 "denoising_strength": 1.0,
                 "masking_strength": 0,
                 "audio_prompt_type": "",
-                "alt_guidance_scale": 1.0,
-                "slg_layers": [29],
+                "perturbation_layers": default_perturbation_layers,
 	            }
         )
         ui_defaults.setdefault("audio_scale", 1.0)
-        ui_defaults.setdefault("alt_guidance_scale", 1.0)
         pipeline_kind = model_def.get("ltx2_pipeline", "two_stage")
         if pipeline_kind != "distilled":
-            ui_defaults.setdefault("guidance_phases", 2)
+            ui_defaults.update(_default_dev_settings(base_model_type))
         else:
             ui_defaults.setdefault("guidance_phases", 1)

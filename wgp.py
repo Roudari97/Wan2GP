@@ -79,6 +79,7 @@ from shared.gradio.gallery import AdvancedMediaGallery
 from shared.ffmpeg_setup import download_ffmpeg
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
 from shared.llm_engines.nanovllm.vllm_support import resolve_lm_decoder_engine
+from shared import model_dropdowns
 from collections import defaultdict
 
 # import torch._dynamo as dynamo
@@ -94,8 +95,8 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.6"
-WanGP_version = "10.952"
-settings_version = 2.52
+WanGP_version = "10.981"
+settings_version = 2.55
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
 image_names_list = ["image_start", "image_end", "image_refs"]
@@ -2439,6 +2440,11 @@ _normalize_profile_defaults(server_config)
 _normalize_output_paths(server_config)
 lm_decoder_engine = server_config.get("lm_decoder_engine", "")
 
+from preprocessing.matanyone.utils.model_signature import delete_if_not_matanyone2_model
+mask_model_path = fl.locate_file("mask/model.safetensors", error_if_none=False)
+if delete_if_not_matanyone2_model(mask_model_path):
+    print("Removing old version of 'mask/model.safetensors'. MatAnyone2 will be downloaded next time you use it.")
+
 #   Deprecated models
 for path in  ["wan2.1_Vace_1.3B_preview_bf16.safetensors", "sky_reels2_diffusion_forcing_1.3B_bf16.safetensors","sky_reels2_diffusion_forcing_720p_14B_bf16.safetensors",
 "sky_reels2_diffusion_forcing_720p_14B_quanto_int8.safetensors", "sky_reels2_diffusion_forcing_720p_14B_quanto_fp16_int8.safetensors", "wan2.1_image2video_480p_14B_bf16.safetensors", "wan2.1_image2video_480p_14B_quanto_int8.safetensors",
@@ -2687,7 +2693,6 @@ def get_model_filename(model_type, quantization ="int8", dtype_policy = "", modu
 
         for quant_type in quant_order:
             quant_tokens += quant_router.get_quantization_tokens(quant_type) or []
-
         sub_choices = []
         for token in quant_tokens:
             sub_choices += [name for name in choices if token in os.path.basename(name).lower()]
@@ -2750,6 +2755,21 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
         ui_defaults["alt_prompt"] = ""
 
     if "lset_name" in ui_defaults: del ui_defaults["lset_name"]
+
+    if settings_version < 2.54:
+        renamed_settings = {
+            "slg_switch": "perturbation_switch",
+            "slg_layers": "perturbation_layers",
+            "slg_start_perc": "perturbation_start_perc",
+            "slg_end_perc": "perturbation_end_perc",
+        }
+        for old_name, new_name in renamed_settings.items():
+            if old_name in ui_defaults:
+                ui_defaults.setdefault(new_name, ui_defaults[old_name])
+                del ui_defaults[old_name]
+
+    if settings_version < 2.55:
+        ui_defaults.setdefault("alt_scale", 0.0)
 
     audio_prompt_type = ui_defaults.get("audio_prompt_type", None)
     if settings_version < 2.2: 
@@ -4349,6 +4369,7 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
             video_guidance3_scale = configs.get("guidance3_scale", None)
             video_audio_guidance_scale = configs.get("audio_guidance_scale", None)
             video_alt_guidance_scale = configs.get("alt_guidance_scale", None)
+            video_alt_scale = configs.get("alt_scale", None)
             video_temperature = configs.get("temperature", None)
             video_top_p = configs.get("top_p", None)
             video_top_k = configs.get("top_k", None)
@@ -4500,6 +4521,10 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
             if alt_guidance_type is not None and video_alt_guidance_scale is not None:
                 values += [video_alt_guidance_scale]
                 labels += [alt_guidance_type]
+            alt_scale_type = model_def.get("alt_scale", None)
+            if alt_scale_type is not None and video_alt_scale is not None:
+                values += [video_alt_scale]
+                labels += [alt_scale_type]
             if model_def.get("flow_shift", False):
                 values += [video_flow_shift]
                 labels += ["Shift Scale"]
@@ -5693,6 +5718,7 @@ def generate_video(
     guidance_phases,
     model_switch_phase,
     alt_guidance_scale,
+    alt_scale,
     audio_guidance_scale,
     audio_scale,
     flow_shift,
@@ -5753,10 +5779,10 @@ def generate_video(
     NAG_scale,
     NAG_tau,
     NAG_alpha,
-    slg_switch,
-    slg_layers,    
-    slg_start_perc,
-    slg_end_perc,
+    perturbation_switch,
+    perturbation_layers,
+    perturbation_start_perc,
+    perturbation_end_perc,
     apg_switch,
     cfg_star_switch,
     cfg_zero_step,
@@ -5863,6 +5889,7 @@ def generate_video(
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")
+        send_cmd("refresh_models", get_unique_id())
         reload_needed=  False
     if args.test:
         send_cmd("info", "Test mode: model loaded, skipping generation.")
@@ -5881,8 +5908,8 @@ def generate_video(
     width, height = int(width) // block_size *  block_size, int(height) // block_size *  block_size
     default_image_size = (height, width)
 
-    if slg_switch == 0:
-        slg_layers = None
+    if perturbation_switch == 0:
+        perturbation_layers = None
 
     offload.shared_state["_attention"] =  attn
     device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576
@@ -6586,9 +6613,10 @@ def generate_video(
                     enable_RIFLEx = enable_RIFLEx,
                     VAE_tile_size = VAE_tile_size,
                     joint_pass = joint_pass,
-                    slg_layers = slg_layers,
-                    slg_start = slg_start_perc/100,
-                    slg_end = slg_end_perc/100,
+                    perturbation_switch = perturbation_switch,
+                    perturbation_layers = perturbation_layers,
+                    perturbation_start = perturbation_start_perc/100,
+                    perturbation_end = perturbation_end_perc/100,
                     apg_switch = apg_switch,
                     cfg_star_switch = cfg_star_switch,
                     cfg_zero_step = cfg_zero_step,
@@ -6604,6 +6632,7 @@ def generate_video(
                     audio_context_lens= audio_context_lens,
                     context_scale = context_scale,
                     control_scale_alt = control_net_weight_alt,
+                    alt_scale = alt_scale,
                     motion_amplitude = motion_amplitude,
                     model_mode = model_mode,
                     causal_block_size = 5,
@@ -6646,7 +6675,8 @@ def generate_video(
                     pause_seconds=pause_seconds,
                     top_p=top_p,
                     top_k=top_k,
-                    set_progress_status=set_progress_status,                     
+                    set_progress_status=set_progress_status,
+                    loras_selected=loras_selected,                 
                 )
             except Exception as e:
                 if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
@@ -7103,7 +7133,7 @@ def process_tasks(state):
     gen["status"] = "Generating..."
     gen["header_text"] = ""    
 
-    yield time.time(), time.time()
+    yield time.time(), time.time(), gr.update()
 
     com_stream = AsyncStream()
     send_cmd = com_stream.output_queue.push
@@ -7217,7 +7247,7 @@ def process_tasks(state):
         elif cmd == "output":
             gen["preview"] = None
             gen["refresh_tab"] = True
-            yield time.time(), time.time()
+            yield time.time(), time.time(), gr.update()
         elif cmd == "progress":
             gen["progress_args"] = data
         elif cmd == "preview":
@@ -7230,9 +7260,11 @@ def process_tasks(state):
                 torch.cuda.current_stream().synchronize()
                 preview = None if data is None else generate_preview(current_model_type, data) 
                 gen["preview"] = preview
-                yield time.time() , gr.Text()
+                yield time.time(), gr.Text(), gr.update()
             except Exception:
                 pass
+        elif cmd == "refresh_models":
+            yield gr.update(), gr.update(), (data if data is not None else get_unique_id())
         else:
             pass
 
@@ -8033,6 +8065,9 @@ def prepare_inputs_dict(target, inputs, model_type = None, model_filename = None
     if model_def.get("alt_guidance", None) is None:
         pop += ["alt_guidance_scale"]
 
+    if model_def.get("alt_scale", None) is None:
+        pop += ["alt_scale"]
+
 
     if not (model_def.get("tea_cache", False) or model_def.get("mag_cache", False)) :
         pop += ["skip_steps_cache_type", "skip_steps_multiplier", "skip_steps_start_step_perc"]
@@ -8056,8 +8091,8 @@ def prepare_inputs_dict(target, inputs, model_type = None, model_filename = None
     if model_def.get("no_negative_prompt", False) :
         pop += ["negative_prompt" ] 
 
-    if not model_def.get("skip_layer_guidance", False):
-        pop += ["slg_switch", "slg_layers", "slg_start_perc", "slg_end_perc"]
+    if not model_def.get("perturbation", False):
+        pop += ["perturbation_switch", "perturbation_layers", "perturbation_start_perc", "perturbation_end_perc"]
 
     if not model_def.get("cfg_zero", False):
         pop += [ "cfg_zero_step"  ] 
@@ -8609,6 +8644,9 @@ def goto_model_type(state, model_type):
     gen = get_gen_info(state)
     return *generate_dropdown_model_list(model_type), gr.update()
 
+def refresh_model_dropdowns(state):
+    return *generate_dropdown_model_list(get_state_model_type(state)), gr.update()
+
 def reset_settings(state):
     model_type = get_state_model_type(state)
     ui_defaults = get_default_settings(model_type)
@@ -8640,6 +8678,7 @@ def save_inputs(
             guidance_phases,
             model_switch_phase,
             alt_guidance_scale,
+            alt_scale,
             audio_guidance_scale,
             audio_scale,
             flow_shift,
@@ -8700,10 +8739,10 @@ def save_inputs(
             NAG_scale,
             NAG_tau,
             NAG_alpha,
-            slg_switch, 
-            slg_layers,
-            slg_start_perc,
-            slg_end_perc,
+            perturbation_switch,
+            perturbation_layers,
+            perturbation_start_perc,
+            perturbation_end_perc,
             apg_switch,
             cfg_star_switch,
             cfg_zero_step,
@@ -10241,11 +10280,14 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         any_audio_guidance = model_def.get("audio_guidance", False) 
                         any_embedded_guidance = model_def.get("embedded_guidance", False)
                         alt_guidance_type = model_def.get("alt_guidance", None)
-                        any_alt_guidance = alt_guidance_type is not None                        
-                        with gr.Row(visible =any_embedded_guidance or any_audio_guidance or any_alt_guidance) as embedded_guidance_row:
+                        any_alt_guidance = alt_guidance_type is not None
+                        alt_scale_type = model_def.get("alt_scale", None)
+                        any_alt_scale = alt_scale_type is not None
+                        with gr.Row(visible =any_embedded_guidance or any_audio_guidance or any_alt_guidance or any_alt_scale) as embedded_guidance_row:
                             audio_guidance_scale = gr.Slider(1.0, 20.0, value=ui_get("audio_guidance_scale"), step=0.5, label="Audio Guidance", visible= any_audio_guidance, show_reset_button= False )
                             embedded_guidance_scale = gr.Slider(1.0, 20.0, value=ui_get("embedded_guidance_scale"), step=0.5, label="Embedded Guidance Scale", visible=any_embedded_guidance, show_reset_button= False )
                             alt_guidance_scale = gr.Slider(1.0, 20.0, value=ui_get("alt_guidance_scale"), step=0.5, label= alt_guidance_type if any_alt_guidance else "" , visible=any_alt_guidance, show_reset_button= False )
+                            alt_scale = gr.Slider(0.0, 1.0, value=ui_get("alt_scale"), step=0.05, label= alt_scale_type if any_alt_scale else "" , visible=any_alt_scale, show_reset_button= False )
 
                         with gr.Row(visible=model_def.get("pause_between_sentences", False)) as pause_row:
                             pause_seconds = gr.Slider(minimum=0.0, maximum=2.0,  value=ui_get("pause_seconds"), step=0.05, label="Pause between Multi Speakers sentences (seconds)", show_reset_button=False,)
@@ -10424,39 +10466,38 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         gr.Markdown("<B>Add Custom Soundtrack to Video</B>")
                         audio_source = gr.Audio(value= ui_defaults.get("audio_source", None), type="filepath", label="Soundtrack", show_download_button= True)
                         
-                any_skip_layer_guidance = model_def.get("skip_layer_guidance", False)
+                any_perturbation = model_def.get("perturbation", False)
                 any_cfg_zero = model_def.get("cfg_zero", False)
                 any_cfg_star = model_def.get("cfg_star", False)
                 any_apg = model_def.get("adaptive_projected_guidance", False)
                 any_motion_amplitude = model_def.get("motion_amplitude", False) and not image_outputs
                 any_pnp = True # Enable PnP for all supported models (or restriction logic here)
 
-                with gr.Tab("Quality", visible = (vace and image_outputs or any_skip_layer_guidance or any_cfg_zero or any_cfg_star or any_apg or any_motion_amplitude or any_pnp) and not audio_only ) as quality_tab:
-                        with gr.Column(visible = any_skip_layer_guidance ) as skip_layer_guidance_row:
-                            gr.Markdown("<B>Skip Layer Guidance (improves video quality, requires guidance > 1)</B>")
+                with gr.Tab("Quality", visible = (vace and image_outputs or any_perturbation or any_cfg_zero or any_cfg_star or any_apg or any_motion_amplitude or any_pnp) and not audio_only ) as quality_tab:
+                        with gr.Column(visible = any_perturbation ) as perturbation_row:
+                            gr.Markdown("<B>Perturbation (improves video quality, requires guidance > 1)</B>")
+                            perturbation_choices = model_def.get("perturbation_choices", [("OFF", 0), ("Skip Layer Guidance", 1)])
+                            perturbation_layers_max = model_def.get("perturbation_layers_max", 40)
                             with gr.Row():
-                                slg_switch = gr.Dropdown(
-                                    choices=[
-                                        ("OFF", 0),
-                                        ("ON", 1), 
-                                    ],
-                                    value=ui_get("slg_switch"),
+                                perturbation_switch = gr.Dropdown(
+                                    choices=perturbation_choices,
+                                    value=ui_get("perturbation_switch"),
                                     visible=True,
                                     scale = 1,
-                                    label="Skip Layer guidance"
+                                    label="Perturbation"
                                 )
-                                slg_layers = gr.Dropdown(
+                                perturbation_layers = gr.Dropdown(
                                     choices=[
-                                        (str(i), i ) for i in range(40)
+                                        (str(i), i ) for i in range(perturbation_layers_max)
                                     ],
-                                    value=ui_get("slg_layers"),
+                                    value=ui_get("perturbation_layers"),
                                     multiselect= True,
-                                    label="Skip Layers",
+                                    label="Perturbation Layers",
                                     scale= 3
                                 )
                             with gr.Row():
-                                slg_start_perc = gr.Slider(0, 100, value=ui_get("slg_start_perc"), step=1, label="Denoising Steps % start", show_reset_button= False) 
-                                slg_end_perc = gr.Slider(0, 100, value=ui_get("slg_end_perc"), step=1, label="Denoising Steps % end", show_reset_button= False) 
+                                perturbation_start_perc = gr.Slider(0, 100, value=ui_get("perturbation_start_perc"), step=1, label="Denoising Steps % start", show_reset_button= False)
+                                perturbation_end_perc = gr.Slider(0, 100, value=ui_get("perturbation_end_perc"), step=1, label="Denoising Steps % end", show_reset_button= False)
 
                         with gr.Column(visible= any_apg ) as apg_col:
                             gr.Markdown("<B>Correct Progressive Color Saturation during long Video Generations")
@@ -10688,6 +10729,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         output_audio = AudioGallery(audio_paths=[], max_thumbnails=999, height=40, update_only=update_form)
                         audio_files_paths, audio_file_selected, audio_gallery_refresh_trigger = output_audio.get_state()
                 output_trigger = gr.Text(interactive= False, visible=False)
+                refresh_models_trigger = gr.Text(interactive= False, visible=False)
                 refresh_form_trigger = gr.Text(interactive= False, visible=False)
                 fill_wizard_prompt_trigger = gr.Text(interactive= False, visible=False)
                 save_form_trigger = gr.Text(interactive= False, visible=False)
@@ -10799,7 +10841,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
 
         extra_inputs = prompt_vars + [wizard_prompt, wizard_variables_var, wizard_prompt_activated_var, video_prompt_column, image_prompt_column, image_prompt_type_group, image_prompt_type_radio, image_prompt_type_endcheckbox,
                                       prompt_column_advanced, prompt_column_wizard_vars, prompt_column_wizard, alt_prompt_row, lset_name, save_lset_prompt_drop, advanced_row, speed_tab, audio_tab, mmaudio_col, quality_tab,
-                                      sliding_window_tab, misc_tab, prompt_enhancer_row, inference_steps_row, skip_layer_guidance_row, audio_guide_row, custom_guide_row, RIFLEx_setting_col,
+                                      sliding_window_tab, misc_tab, prompt_enhancer_row, inference_steps_row, perturbation_row, audio_guide_row, custom_guide_row, RIFLEx_setting_col,
                                       video_prompt_type_video_guide, video_prompt_type_video_guide_alt, video_prompt_type_video_mask, video_prompt_type_image_refs, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox,
                                       apg_col, audio_prompt_type_sources,  audio_prompt_type_remux, audio_prompt_type_remux_row, force_fps_col,
                                       video_guide_outpainting_col,video_guide_outpainting_top, video_guide_outpainting_bottom, video_guide_outpainting_left, video_guide_outpainting_right,
@@ -11068,6 +11110,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 # main_tabs.select(fn=detect_auto_save_form, inputs= [state], outputs= save_form_trigger, trigger_mode="multiple")
                 model_family.input(fn=change_model_family, inputs=[state, model_family], outputs= [model_base_type_choice, model_choice], show_progress="hidden")
                 model_base_type_choice.input(fn=change_model_base_types, inputs=[state, model_family, model_base_type_choice], outputs= [model_base_type_choice, model_choice], show_progress="hidden")
+                refresh_models_trigger.change(fn=refresh_model_dropdowns, inputs=[state], outputs=[model_family, model_base_type_choice, model_choice, refresh_form_trigger], show_progress="hidden")
 
                 model_choice.change(fn=validate_wizard_prompt,
                     inputs= [state, wizard_prompt_activated_var, wizard_variables_var,  prompt, wizard_prompt, *prompt_vars] ,
@@ -11125,7 +11168,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                     outputs= [status_trigger],             
                 ).then(fn=process_tasks,
                     inputs= [state],
-                    outputs= [preview_trigger, output_trigger], 
+                    outputs= [preview_trigger, output_trigger, refresh_models_trigger], 
                     show_progress="hidden",
                 ).then(finalize_generation,
                     inputs= [state], 
@@ -11157,7 +11200,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 ).then(
                     fn=process_tasks,
                     inputs=[state],
-                    outputs=[preview_trigger, output_trigger],
+                    outputs=[preview_trigger, output_trigger, refresh_models_trigger],
                     trigger_mode="once"
                 ).then(
                     fn=finalize_generation_with_state,
@@ -11238,237 +11281,45 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
 
 
 def compact_name(family_name, model_name):
-    if model_name.startswith(family_name):
-        return model_name[len(family_name):].strip()
-    return model_name
+    return model_dropdowns.compact_name(family_name, model_name)
 
+def _get_dropdown_deps():
+    return model_dropdowns.DropdownDeps(
+        transformer_types=transformer_types,
+        displayed_model_types=displayed_model_types,
+        transformer_type=transformer_type,
+        three_levels_hierarchy=three_levels_hierarchy,
+        families_infos=families_infos,
+        server_config=server_config,
+        transformer_quantization=transformer_quantization,
+        transformer_dtype_policy=transformer_dtype_policy,
+        text_encoder_quantization=text_encoder_quantization,
+        get_model_def=get_model_def,
+        get_model_recursive_prop=get_model_recursive_prop,
+        get_model_filename=get_model_filename,
+        get_local_model_filename=get_local_model_filename,
+        get_lora_dir=get_lora_dir,
+        get_parent_model_type=get_parent_model_type,
+        get_base_model_type=get_base_model_type,
+        get_model_family=get_model_family,
+        get_model_name=get_model_name,
+        get_transformer_dtype=get_transformer_dtype,
+    )
 
 def create_models_hierarchy(rows):
-    """
-    rows: list of (model_name, model_id, parent_model_id)
-    returns:
-      parents_list: list[(parent_header, parent_id)]
-      children_dict: dict[parent_id] -> list[(child_display_name, child_id)]
-    """
-    toks=lambda s:[t for t in s.split() if t]
-    norm=lambda s:' '.join(s.split()).casefold()
-
-    groups,parents,order=defaultdict(list),{},[]
-    for name,mid,pmid in rows:
-        groups[pmid].append((name,mid))
-        if mid==pmid and pmid not in parents:
-            parents[pmid]=name; order.append(pmid)
-
-    parents_list,children_dict=[],{}
-
-    # --- Real parents ---
-    for pid in order:
-        p_name=parents[pid]; p_tok=toks(p_name); p_low=[w.casefold() for w in p_tok]
-        n=len(p_low); p_last=p_low[-1]; p_set=set(p_low)
-
-        kids=[]
-        for name,mid in groups.get(pid,[]):
-            ot=toks(name); lt=[w.casefold() for w in ot]; st=set(lt)
-            kids.append((name,mid,ot,lt,st))
-
-        outliers={mid for _,mid,_,_,st in kids if mid!=pid and p_set.isdisjoint(st)}
-
-        # Only parent + children that start with parent's first word contribute to prefix
-        prefix_non=[]
-        for name,mid,ot,lt,st in kids:
-            if mid==pid or (mid not in outliers and lt and lt[0]==p_low[0]):
-                prefix_non.append((ot,lt))
-
-        def lcp_len(a,b):
-            i=0; m=min(len(a),len(b))
-            while i<m and a[i]==b[i]: i+=1
-            return i
-        L=n if len(prefix_non)<=1 else min(lcp_len(lt,p_low) for _,lt in prefix_non)
-        if L==0 and len(prefix_non)>1: L=n
-
-        shares_last=any(mid!=pid and mid not in outliers and lt and lt[-1]==p_last
-                        for _,mid,_,lt,_ in kids)
-        header_tokens_disp=p_tok[:L]+([p_tok[-1]] if shares_last and L<n else [])
-        header=' '.join(header_tokens_disp)
-        header_has_last=(L==n) or (shares_last and L<n)
-
-        prefix_low=p_low[:L]
-        def startswith_prefix(lt):
-            if L==0 or len(lt)<L: return False
-            for i in range(L):
-                if lt[i]!=prefix_low[i]: return False
-            return True
-
-        def base_rem(ot, lt):
-            return ot[L:] if startswith_prefix(lt) else ot[:]
-
-        def trim_rem(rem, lt):
-            out = rem[:]
-            if header_has_last and lt and lt[-1] == p_last and out and out[-1].casefold() == p_last:
-                out = out[:-1]
-            return out
-
-        kid_infos = []
-        for name, mid, ot, lt, _ in kids:
-            rem_core = base_rem(ot, lt) if mid not in outliers else ot[:]
-            kid_infos.append({
-                "name": name,
-                "mid": mid,
-                "ot": ot,
-                "lt": lt,
-                "outlier": mid in outliers,
-                "rem_core": rem_core,
-                "rem_trim": trim_rem(rem_core, lt) if mid not in outliers else ot[:],
-                "rem_set": {w.casefold() for w in rem_core} if mid not in outliers else set(),
-                "rem_trim_set": {w.casefold() for w in (trim_rem(rem_core, lt) if mid not in outliers else ot[:])} if mid not in outliers else set(),
-            })
-
-        default_info = next(info for info in kid_infos if info["mid"] == pid)
-        other_words = set()
-        for info in kid_infos:
-            if info["mid"] != pid:
-                other_words |= info["rem_set"]
-        default_shares = bool(default_info["rem_set"] & other_words)
-
-        def disp(info):
-            if info["outlier"]:
-                return info["name"]
-            if info["mid"] == pid:
-                if not default_shares:
-                    return 'Default'
-                rem = info["rem_trim"]
-            else:
-                rem = info["rem_trim"]
-            s = ' '.join(rem).strip()
-            return s if s else 'Default'
-
-        entries=[(disp(default_info),pid)]
-        for info in kid_infos:
-            if info["mid"]==pid: continue
-            entries.append((disp(info), info["mid"]))
-
-        # Number "Default" for children whose full name == parent's full name
-        p_full=norm(p_name); full_by_mid={mid:name for name,mid,*_ in kids}
-        num=2; numbered=[entries[0]]
-        for dname,mid in entries[1:]:
-            if dname=='Default' and norm(full_by_mid[mid])==p_full:
-                numbered.append((f'Default #{num}',mid)); num+=1
-            else:
-                numbered.append((dname,mid))
-
-        parents_list.append((header,pid))
-        children_dict[pid]=numbered
-
-    # --- Orphan groups (no real parent present) ---
-    for pid in groups.keys():
-        if pid in parents: continue
-        first_name=groups[pid][0][0]
-        parents_list.append((first_name,pid))               # fake parent: full name of first orphan
-        children_dict[pid]=[(name,mid) for name,mid in groups[pid]]  # copy full names only
-    
-    parents_list = sorted(parents_list, key=lambda c: c[0])
-    return parents_list,children_dict
-
+    return model_dropdowns.create_models_hierarchy(rows)
 
 def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type, three_levels = True):
-    models_families = [get_model_family(type, for_ui= True) for type in dropdown_types] 
-    families = {}
-    for family in models_families:
-        if family not in families: families[family] = 1
-
-    families_orders = [  families_infos[family][0]  for family in families ]
-    families_labels = [  families_infos[family][1]  for family in families ]
-    sorted_familes = [ info[1:] for info in sorted(zip(families_orders, families_labels, families), key=lambda c: c[0])]
-    if current_model_family is None:
-        dropdown_choices = [ (families_infos[family][0], get_model_name(model_type), model_type) for model_type, family in zip(dropdown_types, models_families)]
-    else:
-        dropdown_choices = [ (families_infos[family][0], compact_name(families_infos[family][1], get_model_name(model_type)), model_type) for model_type, family in zip( dropdown_types, models_families) if family == current_model_family]
-    dropdown_choices = sorted(dropdown_choices, key=lambda c: (c[0], c[1]))
-    if three_levels:
-        dropdown_choices = [ (*model[1:], get_parent_model_type(model[2])) for model in dropdown_choices] 
-        sorted_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
-        return sorted_familes, sorted_choices, finetunes_dict[get_parent_model_type(current_model_type)]
-        
-    else:
-        dropdown_types_list = list({get_base_model_type(model[2]) for model in dropdown_choices})
-        dropdown_choices = [model[1:] for model in dropdown_choices] 
-        return sorted_familes, dropdown_types_list, dropdown_choices 
-
-
+    return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type, three_levels)
 
 def generate_dropdown_model_list(current_model_type):
-    dropdown_types= transformer_types if len(transformer_types) > 0 else displayed_model_types 
-    if current_model_type not in dropdown_types:
-        dropdown_types.append(current_model_type)
-    current_model_family = get_model_family(current_model_type, for_ui= True)
-    sorted_familes, sorted_models, sorted_finetunes = get_sorted_dropdown(dropdown_types, current_model_family, current_model_type, three_levels=three_levels_hierarchy)
-
-    dropdown_families = gr.Dropdown(
-        choices= sorted_familes,
-        value= current_model_family,
-        show_label= False,
-        scale= 2 if three_levels_hierarchy else 1,
-        elem_id="family_list",
-        min_width=50
-        )
-
-    dropdown_models = gr.Dropdown(
-        choices= sorted_models,
-        value= get_parent_model_type(current_model_type) if three_levels_hierarchy  else get_base_model_type(current_model_type),
-        show_label= False,
-        scale= 3 if len(sorted_finetunes) > 1 else 7, 
-        elem_id="model_base_types_list",
-        visible= three_levels_hierarchy
-        )
-    
-    dropdown_finetunes = gr.Dropdown(
-        choices= sorted_finetunes,
-        value= current_model_type,
-        show_label= False,
-        scale= 4,
-        visible= len(sorted_finetunes) > 1 or not three_levels_hierarchy,
-        elem_id="model_list",
-        )
-    
-    return dropdown_families, dropdown_models, dropdown_finetunes
+    return model_dropdowns.generate_dropdown_model_list(_get_dropdown_deps(), current_model_type)
 
 def change_model_family(state, current_model_family):
-    dropdown_types= transformer_types if len(transformer_types) > 0 else displayed_model_types 
-    current_family_name = families_infos[current_model_family][1]
-    models_families = [get_model_family(type, for_ui= True) for type in dropdown_types] 
-    dropdown_choices = [ (compact_name(current_family_name,  get_model_name(model_type)), model_type) for model_type, family in zip(dropdown_types, models_families) if family == current_model_family ]
-    dropdown_choices = sorted(dropdown_choices, key=lambda c: c[0])
-    last_model_per_family = state.get("last_model_per_family", {})
-    model_type = last_model_per_family.get(current_model_family, "")
-    if len(model_type) == "" or model_type not in [choice[1] for choice in dropdown_choices] :  model_type = dropdown_choices[0][1]
-
-    if three_levels_hierarchy:
-        parent_model_type = get_parent_model_type(model_type)
-        dropdown_choices = [ (*tup, get_parent_model_type(tup[1])) for tup in dropdown_choices] 
-        dropdown_base_types_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
-        dropdown_choices = finetunes_dict[parent_model_type ]
-        model_finetunes_visible = len(dropdown_choices) > 1 
-    else:
-        parent_model_type = get_base_model_type(model_type)
-        model_finetunes_visible = True
-        dropdown_base_types_choices = list({get_base_model_type(model[1]) for model in dropdown_choices})
-
-    return gr.Dropdown(choices= dropdown_base_types_choices, value = parent_model_type, scale=3 if model_finetunes_visible else 7), gr.Dropdown(choices= dropdown_choices, value = model_type, visible = model_finetunes_visible )
+    return model_dropdowns.change_model_family(_get_dropdown_deps(), state, current_model_family)
 
 def change_model_base_types(state,  current_model_family, model_base_type_choice):
-    if not three_levels_hierarchy: return gr.update()
-    dropdown_types= transformer_types if len(transformer_types) > 0 else displayed_model_types 
-    current_family_name = families_infos[current_model_family][1]
-    dropdown_choices = [ (compact_name(current_family_name,  get_model_name(model_type)), model_type, model_base_type_choice) for model_type in dropdown_types if get_parent_model_type(model_type) == model_base_type_choice and get_model_family(model_type, for_ui= True) == current_model_family]
-    dropdown_choices = sorted(dropdown_choices, key=lambda c: c[0])
-    _, finetunes_dict = create_models_hierarchy(dropdown_choices)
-    dropdown_choices = finetunes_dict[model_base_type_choice ]
-    model_finetunes_visible = len(dropdown_choices) > 1 
-    last_model_per_type = state.get("last_model_per_type", {})
-    model_type = last_model_per_type.get(model_base_type_choice, "")
-    if len(model_type) == "" or model_type not in [choice[1] for choice in dropdown_choices] :  model_type = dropdown_choices[0][1]
-
-    return gr.update(scale=3 if model_finetunes_visible else 7), gr.Dropdown(choices= dropdown_choices, value = model_type, visible=model_finetunes_visible )
+    return model_dropdowns.change_model_base_types(_get_dropdown_deps(), state, current_model_family, model_base_type_choice)
 
 def get_js():
     start_quit_timer_js = """
@@ -11749,7 +11600,12 @@ def create_ui():
                 show_progress="hidden"
             )
 
-            video_generator_tab.select(lambda state: state.update({"active_form": "add"}), inputs=state)
+            video_generator_tab.select(lambda state: state.update({"active_form": "add"}), inputs=state).then(
+                fn=refresh_model_dropdowns,
+                inputs=[state],
+                outputs=[model_family, model_base_type_choice, model_choice, refresh_form_trigger],
+                show_progress="hidden",
+            )
             edit_tab.select(lambda state: state.update({"active_form": "edit"}), inputs=state)
             app.setup_ui_tabs(main_tabs, state, generator_tab_components["set_save_form_event"])
         if stats_app is not None:
