@@ -462,9 +462,9 @@ class model_factory:
         randn = None
         masked_steps = 0
 
-        init_image = self._to_image_tensor(input_frames, device)
+        init_image = self._to_image_tensor(image_start, device)
         if init_image is None:
-            init_image = self._to_image_tensor(image_start, device)
+            init_image = self._to_image_tensor(input_frames, device)
 
         if init_image is not None:
             init_image = F.interpolate(
@@ -534,9 +534,12 @@ class model_factory:
             first_step = int(round(num_steps * (1.0 - denoising_strength), 4)) if denoising_strength < 1.0 else 0
             first_step = min(max(first_step, 0), max(num_steps - 1, 0))
             randn = torch.randn(latent_shape, generator=generator, device=device, dtype=torch.float32)
-            if denoising_strength < 1.0 and len(sigmas) > 1:
+            if len(sigmas) > 1:
                 sigma_start = sigmas[first_step]
                 latents = source_latents * (1.0 - sigma_start) + randn * sigma_start
+            else:
+                latents = source_latents.clone()
+            if denoising_strength < 1.0 and len(sigmas) > 1:
                 sigmas = sigmas[first_step:]
                 num_steps = max(len(sigmas) - 1, 0)
             masked_steps = int(np.ceil(num_steps * masking_strength)) if image_mask_latents is not None else 0
