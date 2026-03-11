@@ -78,7 +78,8 @@ class family_handler:
         extra_model_def["text_encoder_URLs"] = [
             build_hf_url("circlestone-labs/Anima", "split_files/text_encoders", "qwen_3_06b_base.safetensors"),
         ]
-        extra_model_def["text_encoder_folder"] = "Anima"
+        extra_model_def["text_encoder_folder"] = os.path.join("Anima", "Qwen3")
+        extra_model_def["t5_tokenizer_folder"] = os.path.join("Anima", "T5_xxl_1.1")
 
         return extra_model_def
 
@@ -137,7 +138,30 @@ class family_handler:
                     )
                     downloaded = os.path.join(tmp, *subfolder.split("/"), filename)
                     shutil.move(downloaded, local_path)
-        return []
+        return [
+            {
+                "repoId": "Qwen/Qwen3-0.6B",
+                "sourceFolderList": [""],
+                "targetFolderList": [os.path.join("Anima", "Qwen3")],
+                "fileList": [[
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "vocab.json",
+                    "merges.txt",
+                    "config.json",
+                ]],
+            },
+            {
+                "repoId": "google/t5-v1_1-xxl",
+                "sourceFolderList": [""],
+                "targetFolderList": [os.path.join("Anima", "T5_xxl_1.1")],
+                "fileList": [[
+                    "spiece.model",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                ]],
+            },
+        ]
 
     @staticmethod
     def load_model(

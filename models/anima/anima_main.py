@@ -237,20 +237,30 @@ class model_factory:
 
         # --- Load Tokenizers ---
         try:
-            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+            text_encoder_folder = model_def.get("text_encoder_folder")
+            if text_encoder_folder:
+                tokenizer_path = os.path.dirname(fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json")))
+            else:
+                tokenizer_path = os.path.dirname(text_encoder_filename)
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         except Exception as exc:
             raise RuntimeError(
-                f"[Anima] Failed to load Qwen3-0.6B tokenizer: {exc}. "
-                "Ensure you have internet access or a cached copy of Qwen/Qwen3-0.6B tokenizer."
+                f"[Anima] Failed to load Qwen3-0.6B tokenizer from local assets: {exc}. "
+                "Ensure the Anima tokenizer files are downloaded."
             ) from exc
 
         # T5 tokenizer for the LLMAdapter embedding (vocab_size=32128)
         try:
-            t5_tokenizer = T5TokenizerFast.from_pretrained("google/t5-v1_1-xxl", legacy=False)
+            t5_tokenizer_folder = model_def.get("t5_tokenizer_folder")
+            if t5_tokenizer_folder:
+                t5_tokenizer_path = os.path.dirname(fl.locate_file(os.path.join(t5_tokenizer_folder, "tokenizer_config.json")))
+            else:
+                t5_tokenizer_path = os.path.dirname(text_encoder_filename)
+            t5_tokenizer = T5TokenizerFast.from_pretrained(t5_tokenizer_path, legacy=False)
         except Exception as exc:
             raise RuntimeError(
-                f"[Anima] Failed to load T5-v1.1-XXL tokenizer: {exc}. "
-                "Ensure you have internet access or a cached copy."
+                f"[Anima] Failed to load T5-v1.1-XXL tokenizer from local assets: {exc}. "
+                "Ensure the Anima T5 tokenizer files are downloaded."
             ) from exc
 
         # --- Load VAE (Qwen Image VAE - AutoencoderKLQwenImage) ---
