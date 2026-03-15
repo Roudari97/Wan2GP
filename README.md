@@ -33,6 +33,38 @@ WanGP supports the Wan (and derived models) but also Hunyuan Video, Flux, Qwen, 
 
 
 ## 🔥 Latest Updates : 
+### March 13th 2026: WanGP v10.9873, Prompt Enhancer has just Been Abliterated
+
+- **Qwen3.5 VL Abliterated Prompt Enhancer**: new choice of Prompt Enhancer
+   * Based on widely acclaimed *Qwen3.5 model* that has just been released
+   * *Uncensored* thanks to the *Abliterating* process that nullifies any *LLM will* to decline any of your request
+   * 4 choices of models: depending on how much VRAM you have *4B & 9B models*, and *GGUF Q4* or *Int8*
+   * *vllm accelerated* x5 faster, if Flash Attention 2 & Triton are installed (please check docs/INSTALLATION.md) 
+   * *Think Mode*: for complex prompt queries
+   
+   Also you can now expand or override a *System Prompt prompt Enhancer* with add @ or @@ (check new doc *PROMPTS.md*)
+
+- **GGUF CUDA Kernels**: 15% speed gain when using GGUF on Diffusion Video Models & x3 speed with GGUF LLM (*Qwen 3.5 VL GGUF* for instance). GGUF Kernels are for the moment only available for Windows (please check docs/INSTALLATION.md).
+
+- **LTX2.3 Improvements**
+   * *End Frame without Start Frame*: you know how your story ends but want to see how it started, just give an End Frame (no start Frame) 
+   * New GGUF Checkpoints
+   * VAE Decoding hopefully should expose less banding
+   * *Multiple Frames Injections*: inject at different positions the reference frames of your choice (works for LTX-2.0 too)
+   * *Image Strength* can be applied now too *End Frames* & *Injected Frames*
+
+- **WanGP API**: rejoice developers (or agents) among you ! WanGP offers now an internal API that allows you to use WanGP as a backend for your apps. It is subject to compliance to the terms & conditions of WanGP license and more specifically to inform the users of your app that WanGP is working behind the scene.
+
+- **LTX Desktop WanGP**: as a sample app (made just for fun) that uses WanGP API, you may try LTX Desktop. This app offers Video / Audio nice editing capabilities but will require 32+ VRAM to run. As now it uses WanGP as its core engine, VRAM requirements are much smaller. It will use LTX 2.3 for Video Gen & Z Image turbo fo Image gen. You can reuse (in theory) your current WanGP install with *LTX Destop WanGP*. https://github.com/deepbeepmeep/LTX-Desktop-WanGP
+
+- **New Audio Ouput formats in mp4**: audio stored in video file can now be of higher quality (*AAC192 - AAC320*) or *ALAC* (lossless). Please note that you wont be able listen to ALAC audio track directly in the webapp.
+
+Also note as people preferred mataynone v1 over v2 I have added an option to select matanyone version in the Config / Extension tab
+
+*update 10.9871*: Improved Qwen3.5 GGUF Prompt Enhancer Output Quality & added Think mode\
+*update 10.9872*: Added LTX 2.0/2.3 frames injection\
+*update 10.9873*: Fixed low fidelity LTX2 injected frames + added Image Strength slider for end & injected frames
+
 ### March 7th 2026: WanGP v10.981, Expecting an Update ? 
 
 - **LTX-2 2.3**: 0 day delivery of LTX 2 latest version with better *audio*, *image 2 video* and *greater details*. This model is bigger (22B versus 19B), but with WanGP VRAM usage will be still ridiculously low. Try it at 720p or 1080p, this is where it will shine the most !
@@ -429,6 +461,7 @@ For detailed installation instructions for different GPU generations:
 ### Basic Usage
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** - First steps and basic usage
 - **[Models Overview](docs/MODELS.md)** - Available models and their capabilities
+- **[Prompts Guide](docs/PROMPTS.md)** - How WanGP interprets prompts, images as prompts, enhancers, and macros
 
 ### Advanced Features
 - **[Loras Guide](docs/LORAS.md)** - Using and managing Loras for customization

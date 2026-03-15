@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import os
@@ -249,7 +250,10 @@ class _LTX2VAEHelper:
         mixed_precision: bool,
         output_height: int | None = None,
         output_width: int | None = None,
-    ) -> int:
+    ) -> int | tuple[int, int]:
+        if vae_config >= 4:
+            vae_config = 0
+
         if vae_config == 0:
             if mixed_precision:
                 device_mem_capacity = device_mem_capacity / 1.5
@@ -266,13 +270,15 @@ class _LTX2VAEHelper:
         if ref_size is not None and ref_size > 480:
             use_vae_config += 1
 
+        spatial_tile_size = 128
         if use_vae_config <= 1:
-            return 0
-        if use_vae_config == 2:
-            return 512
-        if use_vae_config == 3:
-            return 256
-        return 128
+            spatial_tile_size = 0
+        elif use_vae_config == 2:
+            spatial_tile_size = 512
+        elif use_vae_config == 3:
+            spatial_tile_size = 256
+
+        return spatial_tile_size
 
 
 def _attach_lora_preprocessor(transformer: torch.nn.Module) -> None:
@@ -344,7 +350,12 @@ def _coerce_image_list(image_value):
 
 
 def _to_latent_index(frame_idx: int, stride: int) -> int:
-    return int(frame_idx) // int(stride)
+    frame_idx = int(frame_idx)
+    stride = int(stride)
+    if frame_idx <= 0:
+        return 0
+    # Causal LTX VAEs keep pixel frame 0 in its own latent slot.
+    return (frame_idx - 1) // stride + 1
 
 
 def _normalize_tiling_size(tile_size: int) -> int:
@@ -376,11 +387,15 @@ def _normalize_temporal_overlap(overlap_frames: int, tile_frames: int) -> int:
 
 
 def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None) -> TilingConfig | None:
+    temporal_tiling_divisor = 1
     spatial_config = None
     if isinstance(tile_size, (tuple, list)):
         if len(tile_size) == 0:
             tile_size = None
-        tile_size = tile_size[-1]
+        else:
+            if len(tile_size) > 1:
+                temporal_tiling_divisor = max(1, int(tile_size[0] or 1))
+            tile_size = tile_size[-1]
     if tile_size is not None:
         tile_size = _normalize_tiling_size(tile_size)
         if tile_size > 0:
@@ -392,7 +407,8 @@ def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None
 
     temporal_config = None
     if fps is not None and fps > 0:
-        tile_frames = _normalize_temporal_tiling_size(int(math.ceil(float(fps) * 5.0)))
+        temporal_tiling_divisor = max(1, temporal_tiling_divisor)
+        tile_frames = _normalize_temporal_tiling_size(int(math.ceil(float(fps) * 5.0 / temporal_tiling_divisor)))
         if tile_frames > 0:
             overlap_frames = int(round(tile_frames * 3 / 8))
             overlap_frames = _normalize_temporal_overlap(overlap_frames, tile_frames)
@@ -568,12 +584,17 @@ class LTX2:
         transformer_sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
         with init_empty_weights():
             velocity_model = LTXModelConfigurator.from_config(base_config)
-        velocity_model = _load_component(velocity_model, transformer_path, transformer_sd_ops)
+        velocity_model = _load_component(velocity_model, transformer_path, transformer_sd_ops, ignore_unused_weights=True)
         transformer = X0Model(velocity_model)
         transformer.eval().requires_grad_(False)
         VAE_URLs = self.model_def.get("VAE_URLs", None)
         video_vae_path =  fl.locate_file(VAE_URLs[0]) if VAE_URLs is not None and len(VAE_URLs) else _component_path("video_vae")
-        video_config = _component_config(video_vae_path)
+        video_config = copy.deepcopy(_component_config(video_vae_path))
+        video_config_vae = video_config.setdefault("vae", {})
+        video_config_vae["spatial_padding_mode"] = "reflect"
+        video_config_vae["encoder_spatial_padding_mode"] = "reflect"
+        video_config_vae["decoder_spatial_padding_mode"] = "reflect"
+        print("[LTX2 VAE Config] forcing encoder/decoder spatial_padding_mode=reflect")
         with init_empty_weights():
             video_encoder = VideoEncoderConfigurator.from_config(video_config)
             video_decoder = VideoDecoderConfigurator.from_config(video_config)
@@ -719,8 +740,10 @@ class LTX2:
         prefix_frames_count: int = 0,
         input_frames=None,
         input_frames2=None,
+        input_ref_images=None,
         input_masks=None,
         input_masks2=None,
+        frames_relative_positions_list=None,
         masking_strength: float | None = None,
         input_video_strength: float | None = None,
         return_latent_slice=None,
@@ -759,6 +782,18 @@ class LTX2:
 
         image_start = _coerce_image_list(image_start)
         image_end = _coerce_image_list(image_end)
+        if input_ref_images is None:
+            input_ref_images = []
+        elif isinstance(input_ref_images, (list, tuple)):
+            input_ref_images = list(input_ref_images)
+        else:
+            input_ref_images = [input_ref_images]
+        if frames_relative_positions_list is None:
+            frames_relative_positions_list = []
+        elif isinstance(frames_relative_positions_list, (list, tuple)):
+            frames_relative_positions_list = list(frames_relative_positions_list)
+        else:
+            frames_relative_positions_list = [frames_relative_positions_list]
 
         prefix_frames_count = int(prefix_frames_count or 0)
         video_prompt_type = video_prompt_type or ""
@@ -873,6 +908,7 @@ class LTX2:
 
         images = []
         guiding_images = []
+        guiding_images_stage2 = []
         images_stage2 = []
         stage2_override = False
         has_prefix_frames = input_video is not None and torch.is_tensor(input_video) and prefix_frames_count > 0
@@ -897,13 +933,21 @@ class LTX2:
                 if extra_list is not None:
                     extra_list.append(entry)
 
+        def _append_injected_ref_entries(target_list, extra_list=None):
+            injected_ref_count = min(len(input_ref_images), len(frames_relative_positions_list))
+            for ref_image, frame_idx in zip(input_ref_images[:injected_ref_count], frames_relative_positions_list[:injected_ref_count]):
+                entry = (ref_image, int(frame_idx), input_video_strength, "lanczos")
+                target_list.append(entry)
+                if extra_list is not None:
+                    extra_list.append(entry)
+
         if isinstance(self.pipeline, TI2VidTwoStagesPipeline):
             _append_prefix_entries(images, images_stage2)
 
             if image_end is not None:
-                entry = (image_end, _to_latent_index(frame_num - 1, latent_stride), 1.0)
-                images.append(entry)
-                images_stage2.append(entry)
+                entry = (image_end, int(frame_num - 1), input_video_strength)
+                guiding_images.append(entry)
+                guiding_images_stage2.append(entry)
 
             if image_start is not None:
                 entry = (image_start, _to_latent_index(0, latent_stride), input_video_strength, "lanczos")
@@ -914,12 +958,16 @@ class LTX2:
                 else:
                     images.append(entry)
                     images_stage2.append(entry)
+            _append_injected_ref_entries(guiding_images, guiding_images_stage2)
         else:
             _append_prefix_entries(images)
             if image_start is not None:
                 images.append((image_start, _to_latent_index(0, latent_stride), input_video_strength, "lanczos"))
             if image_end is not None:
-                images.append((image_end, _to_latent_index(frame_num - 1, latent_stride), 1.0))
+                entry = (image_end, int(frame_num - 1), input_video_strength)
+                guiding_images.append(entry)
+                guiding_images_stage2.append(entry)
+            _append_injected_ref_entries(guiding_images, guiding_images_stage2)
 
         tiling_config = _build_tiling_config(VAE_tile_size, fps)
         interrupt_check = lambda: self._interrupt
@@ -1051,6 +1099,7 @@ class LTX2:
                 alt_scale=float(alt_scale),
                 images=images,
                 guiding_images=guiding_images or None,
+                guiding_images_stage2=guiding_images_stage2 or None,
                 images_stage2=images_stage2 if stage2_override else None,
                 video_conditioning=video_conditioning,
                 video_conditioning_downscale_factor=video_conditioning_downscale_factor,
@@ -1080,6 +1129,8 @@ class LTX2:
                 num_frames=int(frame_num),
                 frame_rate=float(fps),
                 images=images,
+                guiding_images=guiding_images or None,
+                guiding_images_stage2=guiding_images_stage2 or None,
                 alt_guidance_scale=float(alt_guide_scale),
                 video_conditioning=video_conditioning,
                 video_conditioning_downscale_factor=video_conditioning_downscale_factor,
