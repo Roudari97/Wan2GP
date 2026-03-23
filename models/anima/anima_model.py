@@ -160,7 +160,7 @@ class Predict2Attention(nn.Module):
             k = apply_rotary_pos_emb_predict2(k, rope_emb)
 
         # pay_attention expects [batches, tokens, heads, head_features]
-        out = pay_attention([q, k, v], cross_attn=not self.is_selfattn)
+        out = pay_attention([q, k, v])
         out = rearrange(out, "b s h d -> b s (h d)")
 
         return self.output_proj(out)
