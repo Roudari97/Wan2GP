@@ -33,7 +33,7 @@ from shared.deepy.config import (
     normalize_deepy_vram_mode,
 )
 from shared.deepy import DEFAULT_SYSTEM_PROMPT as ASSISTANT_SYSTEM_PROMPT
-from shared.deepy import media_registry, tool_settings as deepy_tool_settings, ui_settings as deepy_ui_settings, video_tools as deepy_video_tools, vision as deepy_vision
+from shared.deepy import media_registry, tool_settings as deepy_tool_settings, transcription as deepy_transcription, ui_settings as deepy_ui_settings, video_tools as deepy_video_tools, vision as deepy_vision
 from shared.gradio import assistant_chat
 from shared.prompt_enhancer import qwen35_text
 from shared.prompt_enhancer.qwen35_assistant_runtime import (
@@ -55,6 +55,8 @@ _TOOL_TYPE_MAP = {
     "int": "integer",
     "float": "number",
     "bool": "boolean",
+    "list": "array",
+    "dict": "object",
 }
 _AI_GEN_NO = 0
 _DOCS_DIR = Path(__file__).resolve().parents[2] / "docs"
@@ -94,7 +96,42 @@ def set_assistant_debug(enabled: bool) -> None:
 
 def _json_type_from_annotation(annotation) -> str:
     annotation_name = getattr(annotation, "__name__", str(annotation))
+    if annotation_name.startswith("list["):
+        return "array"
+    if annotation_name.startswith("dict["):
+        return "object"
     return _TOOL_TYPE_MAP.get(annotation_name, "string")
+
+
+def _build_tool_parameter_schema(annotations: dict[str, Any], param_name: str, param_meta: dict[str, Any]) -> dict[str, Any]:
+    schema = {
+        "type": param_meta.get("type") or _json_type_from_annotation(annotations.get(param_name, str)),
+        "description": str(param_meta.get("description", "")).strip(),
+    }
+    for meta_key, meta_value in param_meta.items():
+        if meta_key in {"description", "required", "type"}:
+            continue
+        schema[meta_key] = copy.deepcopy(meta_value)
+    return schema
+
+
+def _get_main_callable(name: str) -> Any:
+    main_module = sys.modules.get("__main__")
+    return None if main_module is None else getattr(main_module, str(name or "").strip(), None)
+
+
+def _get_main_attribute(name: str) -> Any:
+    lookup_name = str(name or "").strip()
+    if len(lookup_name) == 0:
+        return None
+    for module_name in ("__main__", "wgp"):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        value = getattr(module, lookup_name, None)
+        if value is not None:
+            return value
+    return None
 
 
 def assistant_tool(
@@ -330,6 +367,12 @@ class AssistantSessionState:
     generated_seconds_total: float = 0.0
     runtime_max_model_len: int = 0
     chat_stats_signature: str = ""
+    seen_video_gallery_paths: list[str] = field(default_factory=list)
+    seen_audio_gallery_paths: list[str] = field(default_factory=list)
+    generated_client_ids: list[str] = field(default_factory=list)
+    selected_visual_runtime_signature: str = ""
+    selected_audio_runtime_signature: str = ""
+    video_tool_runtime_variants: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -379,6 +422,12 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
     session.generated_seconds_total = 0.0
     session.runtime_max_model_len = 0
     session.chat_stats_signature = ""
+    session.seen_video_gallery_paths = []
+    session.seen_audio_gallery_paths = []
+    session.generated_client_ids = []
+    session.selected_visual_runtime_signature = ""
+    session.selected_audio_runtime_signature = ""
+    session.video_tool_runtime_variants = {}
     assistant_chat.reset_session_chat(session)
 
 
@@ -548,10 +597,10 @@ class tools:
     def _is_interrupted(self) -> bool:
         return self.session is not None and self.session.interrupt_requested
 
-    def _interrupted_result(self, client_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    def _interrupted_result(self, client_id: str, task: dict[str, Any], *, force_cancel_queue: bool = False) -> dict[str, Any]:
         self._log(f"Generation interrupted for {client_id}")
         cancel_result = {}
-        if self._auto_cancel_queue_tasks_enabled() and len(str(client_id or "").strip()) > 0:
+        if (force_cancel_queue or self._auto_cancel_queue_tasks_enabled()) and len(str(client_id or "").strip()) > 0:
             queue = list((self.gen or {}).get("queue", []) or [])
             if self._queue_contains_client_id(queue, client_id):
                 self.send_cmd("abort_client_id", str(client_id))
@@ -671,17 +720,238 @@ class tools:
         template_label = Path(self.get_tool_template_filename(tool_name)).stem.strip()
         return label if len(template_label) == 0 else f"{label} [{template_label}]"
 
-    def _apply_generation_overrides(self, task: dict[str, Any], *, include_num_frames: bool) -> dict[str, Any]:
+    def _parse_generation_resolution(self, resolution: Any) -> tuple[int | None, int | None]:
+        width_text, separator, height_text = str(resolution or "").strip().lower().partition("x")
+        if separator != "x":
+            return None, None
+        try:
+            return int(width_text), int(height_text)
+        except Exception:
+            return None, None
+
+    def _is_video_generation_tool(self, tool_name: str) -> bool:
+        return str(tool_name or "").strip() in {"gen_video", "gen_video_with_speech"}
+
+    def _supports_inference_steps_override(self, tool_name: str) -> bool:
+        return str(tool_name or "").strip() in {"gen_image", "edit_image", "gen_video", "gen_video_with_speech"}
+
+    def _compute_effective_video_fps(self, task: dict[str, Any]) -> int | None:
+        force_fps = str(task.get("force_fps", "") or "").strip()
+        model_type = str(task.get("model_type", "") or task.get("base_model_type", "") or "").strip()
+        video_guide = str(task.get("video_guide", "") or "").strip() or None
+        video_source = str(task.get("video_source", "") or "").strip() or None
+        get_computed_fps = _get_main_callable("get_computed_fps")
+        if callable(get_computed_fps) and len(model_type) > 0:
+            try:
+                return int(round(float(get_computed_fps(force_fps, model_type, video_guide, video_source))))
+            except Exception:
+                pass
+        if len(force_fps) > 0:
+            try:
+                return int(force_fps)
+            except Exception:
+                pass
+        get_base_model_type = _get_main_callable("get_base_model_type")
+        base_model_type = model_type
+        if callable(get_base_model_type) and len(model_type) > 0:
+            try:
+                base_model_type = str(get_base_model_type(model_type) or model_type).strip() or model_type
+            except Exception:
+                base_model_type = model_type
+        get_model_fps = _get_main_callable("get_model_fps")
+        if callable(get_model_fps) and len(base_model_type) > 0:
+            try:
+                return int(round(float(get_model_fps(base_model_type))))
+            except Exception:
+                return None
+        return None
+
+    def _get_effective_video_latent_size(self, task: dict[str, Any]) -> int | None:
+        model_type = str(task.get("model_type", "") or task.get("base_model_type", "") or "").strip()
+        get_base_model_type = _get_main_callable("get_base_model_type")
+        base_model_type = model_type
+        if callable(get_base_model_type) and len(model_type) > 0:
+            try:
+                base_model_type = str(get_base_model_type(model_type) or model_type).strip() or model_type
+            except Exception:
+                base_model_type = model_type
+        get_model_min_frames_and_step = _get_main_callable("get_model_min_frames_and_step")
+        if callable(get_model_min_frames_and_step) and len(base_model_type) > 0:
+            try:
+                _frames_minimum, _frames_steps, latent_size = get_model_min_frames_and_step(base_model_type)
+                latent_size = int(latent_size)
+                if latent_size > 0:
+                    return latent_size
+            except Exception:
+                pass
+        get_model_def = _get_main_callable("get_model_def")
+        if callable(get_model_def) and len(base_model_type) > 0:
+            try:
+                model_def = get_model_def(base_model_type)
+            except Exception:
+                model_def = None
+            if isinstance(model_def, dict):
+                try:
+                    latent_size = int(model_def.get("latent_size", model_def.get("frames_steps", 0)) or 0)
+                except Exception:
+                    latent_size = 0
+                if latent_size > 0:
+                    return latent_size
+        return None
+
+    @staticmethod
+    def _snap_video_frame_count_to_latent_grid(frame_count: int, latent_size: int | None) -> int:
+        raw_frames = int(frame_count)
+        if raw_frames <= 0:
+            return raw_frames
+        if latent_size is None or int(latent_size) <= 0:
+            return raw_frames
+        step = int(latent_size)
+        return max(1, int(round((raw_frames - 1) / float(step))) * step + 1)
+
+    def _get_effective_generation_defaults(self, tool_name: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        lookup_name = str(tool_name or "").strip()
+        if lookup_name not in deepy_tool_settings.GENERATION_TOOL_IDS:
+            return None, {
+                "status": "error",
+                "tool_id": lookup_name,
+                "error": f"tool_id must be one of: {', '.join(deepy_tool_settings.GENERATION_TOOL_IDS)}.",
+            }
+        generator_variant = self.get_tool_variant(lookup_name)
+        try:
+            task = deepy_tool_settings.build_generation_task(lookup_name, generator_variant, prompt="", client_id="__deepy_defaults__")
+        except Exception as exc:
+            return None, {
+                "status": "error",
+                "tool_id": lookup_name,
+                "template": generator_variant,
+                "error": str(exc),
+            }
+        include_num_frames = self._is_video_generation_tool(lookup_name)
+        task, error_result = self._apply_generation_overrides(lookup_name, task, include_num_frames=include_num_frames)
+        if error_result is not None:
+            error_result["tool_id"] = lookup_name
+            error_result["template"] = generator_variant
+            return None, error_result
+        model_def = self._get_effective_tool_model_def(lookup_name)
+        audio_only = bool(model_def.get("audio_only", False))
+        width = height = None
+        if not audio_only:
+            width, height = self._parse_generation_resolution(task.get("resolution", ""))
+        seed = task.get("seed", None)
+        try:
+            seed = None if seed is None or str(seed).strip() == "" else int(seed)
+        except Exception:
+            seed = None
+        result = {
+            "status": "ok",
+            "tool_id": lookup_name,
+            "template": generator_variant,
+            "width": width,
+            "height": height,
+            "seed": seed,
+        }
+        if self._supports_inference_steps_override(lookup_name):
+            try:
+                num_inference_steps = task.get("num_inference_steps", None)
+                result["num_inference_steps"] = None if num_inference_steps is None or str(num_inference_steps).strip() == "" else int(num_inference_steps)
+            except Exception:
+                result["num_inference_steps"] = None
+        if include_num_frames:
+            result["num_frames"] = None if task.get("video_length", None) is None else int(task.get("video_length"))
+            result["fps"] = self._compute_effective_video_fps(task)
+        if lookup_name == "gen_video":
+            result["multimedia_generation"] = bool(model_def.get("multimedia_generation", False))
+        return result, None
+
+    def _apply_generation_overrides(
+        self,
+        tool_name: str,
+        task: dict[str, Any],
+        *,
+        include_num_frames: bool,
+        width: int | None = None,
+        height: int | None = None,
+        num_frames: int | None = None,
+        duration_seconds: float | None = None,
+        fps: int | None = None,
+        num_inference_steps: int | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         ui_settings = self._get_tool_ui_settings()
         if ui_settings["use_template_properties"]:
-            return task
-        task["resolution"] = f"{ui_settings['width']}x{ui_settings['height']}"
-        task["seed"] = int(ui_settings["seed"])
+            base_resolution = str(task.get("resolution", "") or "").strip()
+            base_num_frames = task.get("video_length", None) if include_num_frames else None
+        else:
+            base_resolution = f"{ui_settings['width']}x{ui_settings['height']}"
+            task["seed"] = int(ui_settings["seed"])
+            if include_num_frames:
+                base_num_frames = int(ui_settings["num_frames"])
+        default_width = default_height = None
+        if len(base_resolution) > 0:
+            default_width, default_height = self._parse_generation_resolution(base_resolution)
+        try:
+            width = None if width is None or str(width).strip() == "" else int(width)
+            height = None if height is None or str(height).strip() == "" else int(height)
+        except Exception:
+            return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": base_resolution, "error": "width and height must be integers."}
+        if width is None or height is None:
+            if default_width is None or default_height is None or default_width <= 0 or default_height <= 0:
+                if width is not None or height is not None:
+                    return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": base_resolution, "error": "width and height must both be provided because the template/default settings do not define a valid resolution."}
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": base_resolution, "error": "Template/default settings do not define a valid resolution."}
+            width = default_width if width is None else width
+            height = default_height if height is None else height
+        min_dim = int(deepy_ui_settings.ASSISTANT_OVERRIDE_DIMENSION_MIN)
+        max_dim = int(deepy_ui_settings.ASSISTANT_OVERRIDE_DIMENSION_MAX)
+        if width < min_dim or width > max_dim or height < min_dim or height > max_dim:
+            return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": f"{width}x{height}", "error": f"width and height must stay between {min_dim} and {max_dim}."}
+        parsed_duration_seconds = None
         if include_num_frames:
-            task["video_length"] = int(ui_settings["num_frames"])
-        return task
+            parsed_duration_seconds, error_result = self._parse_time_value(duration_seconds, "duration_seconds", required=False)
+            if error_result is not None:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": f"{width}x{height}", "error": str(error_result.get("error", "") or "duration_seconds is invalid.")}
+            if parsed_duration_seconds is not None:
+                if parsed_duration_seconds <= 0:
+                    return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": f"{width}x{height}", "error": "duration_seconds must be > 0."}
+                if num_frames is not None and str(num_frames).strip() != "":
+                    return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": f"{width}x{height}", "error": "Specify either num_frames or duration_seconds, not both."}
+        task["resolution"] = f"{width}x{height}"
+        if fps is not None:
+            try:
+                fps = int(fps)
+            except Exception:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": "fps must be an integer."}
+            if fps < 15 or fps > 60:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": "fps must stay between 15 and 60."}
+            task["force_fps"] = str(int(fps))
+        if include_num_frames:
+            if parsed_duration_seconds is not None:
+                effective_fps = int(fps) if fps is not None else self._compute_effective_video_fps(task)
+                if effective_fps is None or effective_fps <= 0:
+                    return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": "Could not determine FPS to convert duration_seconds. Pass fps explicitly."}
+                num_frames = int(round(float(parsed_duration_seconds) * float(effective_fps)))
+                num_frames = self._snap_video_frame_count_to_latent_grid(num_frames, self._get_effective_video_latent_size(task))
+            try:
+                num_frames = base_num_frames if num_frames is None or str(num_frames).strip() == "" else int(num_frames)
+            except Exception:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": "num_frames must be an integer."}
+            min_frames = int(deepy_ui_settings.ASSISTANT_OVERRIDE_FRAMES_MIN)
+            max_frames = int(deepy_ui_settings.ASSISTANT_OVERRIDE_FRAMES_MAX)
+            if num_frames is None or num_frames < min_frames or num_frames > max_frames:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": f"num_frames must stay between {min_frames} and {max_frames}."}
+            task["video_length"] = int(num_frames)
+        if num_inference_steps is not None:
+            try:
+                num_inference_steps = int(num_inference_steps)
+            except Exception:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": "num_inference_steps must be an integer."}
+            if num_inference_steps <= 0:
+                return None, {"status": "error", "client_id": str(task.get("client_id", "") or "").strip(), "output_file": "", "prompt": str(task.get("prompt", "") or "").strip(), "resolution": task["resolution"], "error": "num_inference_steps must be a positive integer."}
+            task["num_inference_steps"] = int(num_inference_steps)
+        return task, None
 
     def _build_generation_task(self, tool_name: str, variant: str, *, prompt: str, client_id: str, **kwargs) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        self._remember_generated_client_id(client_id)
         try:
             task = deepy_tool_settings.build_generation_task(tool_name, variant, prompt=prompt, client_id=client_id, **kwargs)
         except ValueError as exc:
@@ -700,6 +970,101 @@ class tools:
         file_list, file_settings_list, audio_file_list, audio_file_settings_list = self.get_processed_queue(self.gen)
         media_registry.sync_recent_generated_media(self.session, file_list, file_settings_list, max_items=max_items)
         media_registry.sync_recent_generated_media(self.session, audio_file_list, audio_file_settings_list, max_items=max_items)
+
+    def _remember_generated_client_id(self, client_id: str) -> None:
+        if self.session is None:
+            return
+        normalized_client_id = str(client_id or "").strip()
+        if len(normalized_client_id) == 0:
+            return
+        generated_client_ids = [str(value or "").strip() for value in list(self.session.generated_client_ids or []) if len(str(value or "").strip()) > 0]
+        if normalized_client_id in generated_client_ids:
+            return
+        generated_client_ids.append(normalized_client_id)
+        self.session.generated_client_ids = generated_client_ids
+
+    def _register_gallery_media_record(self, media_path: str, settings: dict[str, Any] | None) -> dict[str, Any] | None:
+        if self.session is None:
+            return None
+        normalized_path = str(media_path or "").strip()
+        if len(normalized_path) == 0:
+            return None
+        resolved_settings = settings if isinstance(settings, dict) else None
+        client_id = "" if resolved_settings is None else str(resolved_settings.get("client_id", "") or "").strip()
+        return media_registry.register_media(
+            self.session,
+            normalized_path,
+            settings=resolved_settings,
+            source="deepy" if client_id in {str(value or "").strip() for value in list(self.session.generated_client_ids or []) if len(str(value or "").strip()) > 0} else "wangp",
+            client_id=client_id,
+        )
+
+    def _get_new_user_gallery_media(self) -> dict[str, dict[str, Any]]:
+        if self.session is None:
+            return {}
+        file_list, file_settings_list, audio_file_list, audio_file_settings_list = self.get_processed_queue(self.gen)
+        generated_client_ids = {str(value or "").strip() for value in list(self.session.generated_client_ids or []) if len(str(value or "").strip()) > 0}
+        media_updates = {}
+        gallery_groups = (
+            ("seen_video_gallery_paths", list(file_list or []), list(file_settings_list or [])),
+            ("seen_audio_gallery_paths", list(audio_file_list or []), list(audio_file_settings_list or [])),
+        )
+        for session_attr, gallery_files, gallery_settings in gallery_groups:
+            previous_files = [str(path or "").strip() for path in getattr(self.session, session_attr, []) if len(str(path or "").strip()) > 0]
+            current_pairs = [(str(path or "").strip(), gallery_settings[index] if index < len(gallery_settings) and isinstance(gallery_settings[index], dict) else None) for index, path in enumerate(gallery_files) if len(str(path or "").strip()) > 0]
+            current_files = [path for path, _settings in current_pairs]
+            appended_start = len(previous_files) if len(previous_files) <= len(current_files) and current_files[: len(previous_files)] == previous_files else len(current_files)
+            setattr(self.session, session_attr, list(current_files))
+            if appended_start >= len(current_pairs):
+                continue
+            for media_path, settings in current_pairs[appended_start:]:
+                client_id = "" if not isinstance(settings, dict) else str(settings.get("client_id", "") or "").strip()
+                if len(client_id) > 0 and client_id in generated_client_ids:
+                    continue
+                media_record = self._register_gallery_media_record(media_path, settings)
+                media_type = "" if media_record is None else str(media_record.get("media_type", "") or "").strip()
+                if media_type in {"image", "video", "audio"}:
+                    media_updates[media_type] = media_record
+        return media_updates
+
+    def _get_selected_gallery_media_updates(self) -> list[str]:
+        if self.session is None:
+            return []
+        updates = []
+
+        visual_media_record, _error_result = self._get_selected_media_record_from_source("video", "all")
+        visual_signature = "" if visual_media_record is None else f"{str(visual_media_record.get('media_type', '') or '').strip()}:{str(visual_media_record.get('media_id', '') or '').strip()}"
+        if visual_signature != str(self.session.selected_visual_runtime_signature or "") and visual_media_record is not None:
+            visual_media_type = str(visual_media_record.get("media_type", "") or "").strip()
+            if visual_media_type in {"image", "video"}:
+                instruction = self._runtime_media_instruction(
+                    visual_media_record,
+                    action="selected",
+                    gallery_label="Image / Video Gallery",
+                    reference_label="selected",
+                    why="matched selected media",
+                    selected_payload=True,
+                )
+                if len(instruction) > 0:
+                    updates.append(instruction)
+        self.session.selected_visual_runtime_signature = visual_signature
+
+        audio_media_record, _error_result = self._get_selected_media_record_from_source("audio", "audio")
+        audio_signature = "" if audio_media_record is None else f"audio:{str(audio_media_record.get('media_id', '') or '').strip()}"
+        if audio_signature != str(self.session.selected_audio_runtime_signature or "") and audio_media_record is not None:
+            instruction = self._runtime_media_instruction(
+                audio_media_record,
+                action="selected",
+                gallery_label="Audio Gallery",
+                reference_label="selected",
+                why="matched selected media",
+                selected_payload=True,
+            )
+            if len(instruction) > 0:
+                updates.append(instruction)
+        self.session.selected_audio_runtime_signature = audio_signature
+
+        return updates
 
     def _queue_contains_client_id(self, queue: list[Any], client_id: str) -> bool:
         lookup_client_id = str(client_id or "").strip()
@@ -722,12 +1087,13 @@ class tools:
             payload["why"] = str(why).strip()
         return payload
 
-    def _normalize_selected_media_type(self, media_type: str | None) -> str:
+    def _normalize_selected_media_type(self, media_type: str | None, reference: str | None = None) -> str:
         normalized = str(media_type or "").strip().lower()
-        if normalized in {"", "any", "all"}:
-            return "all"
         if normalized in {"image", "video", "audio"}:
             return normalized
+        if normalized in {"", "any", "all"}:
+            inferred = media_registry.normalize_media_type("any", reference=reference)
+            return "all" if inferred == "any" else inferred
         return "all"
 
     def _selected_media_payload(self, media_record: dict[str, Any], why: str = "") -> dict[str, Any]:
@@ -735,6 +1101,14 @@ class tools:
         payload["path"] = str(media_record.get("path", "")).strip()
         payload.update(self._get_selected_video_position(media_record))
         return payload
+
+    def _runtime_media_instruction(self, media_record: dict[str, Any], *, action: str, gallery_label: str, reference_label: str, why: str = "", selected_payload: bool = False) -> str:
+        media_type = str(media_record.get("media_type", "") or "").strip()
+        media_id = str(media_record.get("media_id", "") or "").strip()
+        if len(media_type) == 0 or len(media_id) == 0:
+            return ""
+        payload = self._selected_media_payload(media_record, why=why) if selected_payload else self._compact_media_payload(media_record, why=why)
+        return f"The user has {action} {media_type} id {media_id} in the {gallery_label}, use this media id if the user asks you to work on the {reference_label} {media_type}. Media details: {_json_dumps(payload)}"
 
     def _get_selected_runtime_snapshot(self) -> dict[str, Any] | None:
         snapshot = {}
@@ -968,6 +1342,26 @@ class tools:
             }
         return media_record, None
 
+    def _resolve_audio_or_video_media(self, media_id: str, parameter_name: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        media_id = str(media_id or "").strip()
+        if len(media_id) == 0:
+            return None, {"status": "error", parameter_name: media_id, "error": f"{parameter_name} is required."}
+        if self.session is None:
+            return None, {"status": "error", parameter_name: media_id, "error": "Assistant session is not available."}
+        media_record = media_registry.get_media_record(self.session, media_id)
+        if media_record is None:
+            return None, {"status": "error", parameter_name: media_id, "error": f"Unknown media id for {parameter_name}."}
+        if media_record.get("media_type") not in {"audio", "video"}:
+            actual_media_type = str(media_record.get("media_type", "") or "").strip() or "unknown media type"
+            return None, {
+                "status": "error",
+                parameter_name: media_record.get("media_id", ""),
+                "actual_media_type": actual_media_type,
+                "media_type": actual_media_type,
+                "error": f"{parameter_name} must reference an audio or video file, not a {actual_media_type}.",
+            }
+        return media_record, None
+
     def _parse_time_value(self, value: Any, parameter_name: str, *, required: bool = False) -> tuple[float | None, dict[str, Any] | None]:
         if value is None or str(value).strip() == "":
             return (None, {"status": "error", "error": f"{parameter_name} is required."}) if required else (None, None)
@@ -979,9 +1373,146 @@ class tools:
             return None, {"status": "error", "error": f"{parameter_name} must be >= 0."}
         return resolved, None
 
-    def _build_direct_media_settings(self, source_media: dict[str, Any], comments: str, **updates: Any) -> dict[str, Any]:
+    def _parse_int_value(self, value: Any, parameter_name: str, *, required: bool = False) -> tuple[int | None, dict[str, Any] | None]:
+        if value is None or str(value).strip() == "":
+            return (None, {"status": "error", "error": f"{parameter_name} is required."}) if required else (None, None)
+        try:
+            resolved = int(value)
+        except Exception:
+            return None, {"status": "error", "error": f"{parameter_name} must be an integer."}
+        if resolved < 0:
+            return None, {"status": "error", "error": f"{parameter_name} must be >= 0."}
+        return resolved, None
+
+    def _parse_bool_value(self, value: Any, parameter_name: str, *, required: bool = False) -> tuple[bool | None, dict[str, Any] | None]:
+        if value is None or str(value).strip() == "":
+            return (None, {"status": "error", "error": f"{parameter_name} is required."}) if required else (None, None)
+        if isinstance(value, bool):
+            return value, None
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True, None
+        if normalized in {"false", "0", "no", "off"}:
+            return False, None
+        return None, {"status": "error", "error": f"{parameter_name} must be true or false."}
+
+    def _resolve_segment_args(
+        self,
+        source_media: dict[str, Any],
+        *,
+        start_time: Any = None,
+        end_time: Any = None,
+        duration: Any = None,
+        start_frame: Any = None,
+        end_frame: Any = None,
+        num_frames: Any = None,
+        allow_empty: bool = False,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        time_inputs = (start_time, end_time, duration)
+        frame_inputs = (start_frame, end_frame, num_frames)
+        has_time_args = any(value is not None and str(value).strip() != "" for value in time_inputs)
+        has_frame_args = any(value is not None and str(value).strip() != "" for value in frame_inputs)
+        if has_time_args and has_frame_args:
+            return None, {"status": "error", "error": "Use either time-based arguments or frame-based arguments, not both."}
+        if not has_time_args and not has_frame_args:
+            if allow_empty:
+                return {"mode": "time", "start_time": None, "end_time": None, "duration": None, "start_frame": None, "end_frame": None, "num_frames": None}, None
+            return None, {"status": "error", "error": "Provide at least one of start_time, end_time, duration, start_frame, end_frame, or num_frames."}
+        if has_frame_args:
+            if str(source_media.get("media_type", "") or "").strip() != "video":
+                return None, {"status": "error", "error": "Frame-based extraction is only supported when media_id references a video."}
+            start_frame, error_result = self._parse_int_value(start_frame, "start_frame")
+            if error_result is not None:
+                return None, error_result
+            end_frame, error_result = self._parse_int_value(end_frame, "end_frame")
+            if error_result is not None:
+                return None, error_result
+            num_frames, error_result = self._parse_int_value(num_frames, "num_frames")
+            if error_result is not None:
+                return None, error_result
+            if end_frame is not None and num_frames is not None:
+                return None, {"status": "error", "error": "Specify either end_frame or num_frames, not both."}
+            start_frame = 0 if start_frame is None else start_frame
+            if num_frames is not None and num_frames <= 0:
+                return None, {"status": "error", "error": "num_frames must be > 0."}
+            media_path = str(source_media.get("path", "")).strip()
+            try:
+                fps, _width, _height, frame_count = get_video_info(media_path)
+            except Exception as exc:
+                return None, {"status": "error", "error": str(exc)}
+            precise_fps = deepy_video_tools.get_precise_video_fps(media_path)
+            effective_fps = float(precise_fps) if precise_fps is not None and precise_fps > 0 else float(fps or 0)
+            if effective_fps <= 0:
+                return None, {"status": "error", "error": "Could not determine source video FPS for frame-based extraction."}
+            max_frame = max(0, int(frame_count) - 1)
+            if start_frame > max_frame:
+                return None, {"status": "error", "error": f"start_frame must be between 0 and {max_frame}."}
+            resolved_end_frame = max_frame
+            if end_frame is not None:
+                if end_frame < start_frame:
+                    return None, {"status": "error", "error": "end_frame must be >= start_frame."}
+                resolved_end_frame = min(end_frame, max_frame)
+            elif num_frames is not None:
+                resolved_end_frame = min(start_frame + num_frames - 1, max_frame)
+            resolved_num_frames = max(0, resolved_end_frame - start_frame + 1)
+            resolved_start_time = start_frame / effective_fps
+            if end_frame is not None:
+                resolved_end_time = (resolved_end_frame + 1) / effective_fps
+                resolved_duration = None
+            elif num_frames is not None:
+                resolved_end_time = None
+                resolved_duration = resolved_num_frames / effective_fps
+            else:
+                resolved_end_time = None
+                resolved_duration = None
+            return {
+                "mode": "frame",
+                "start_time": resolved_start_time,
+                "end_time": resolved_end_time,
+                "duration": resolved_duration,
+                "start_frame": start_frame,
+                "end_frame": resolved_end_frame,
+                "num_frames": resolved_num_frames,
+            }, None
+        start_time, error_result = self._parse_time_value(start_time, "start_time")
+        if error_result is not None:
+            return None, error_result
+        end_time, error_result = self._parse_time_value(end_time, "end_time")
+        if error_result is not None:
+            return None, error_result
+        duration, error_result = self._parse_time_value(duration, "duration")
+        if error_result is not None:
+            return None, error_result
+        if end_time is not None and duration is not None:
+            return None, {"status": "error", "error": "Specify either end_time or duration, not both."}
+        if start_time is None:
+            start_time = 0.0
+        return {"mode": "time", "start_time": start_time, "end_time": end_time, "duration": duration, "start_frame": None, "end_frame": None, "num_frames": None}, None
+
+    def _build_deepy_settings(self, prompt: str, comments: str = "", **updates: Any) -> dict[str, Any]:
+        wangp_version = str(_get_main_attribute("WanGP_version") or "").strip()
+        settings = {
+            "type": f"WanGP v{wangp_version} DeepBeepMeep - Deepy" if len(wangp_version) > 0 else "WanGP DeepBeepMeep - Deepy",
+            "model_type": "Deepy",
+            "prompt": str(prompt or "").strip(),
+            "client_id": _next_ai_client_id(),
+        }
+        self._remember_generated_client_id(settings["client_id"])
+        settings["comments"] = str(comments or "").strip()
+        end_time = time.time()
+        settings["creation_date"] = datetime.fromtimestamp(end_time).isoformat(timespec="seconds")
+        settings["creation_timestamp"] = int(end_time)
+        for key, value in updates.items():
+            if value is not None:
+                settings[key] = value
+        return settings
+
+    def _build_direct_media_settings(self, source_media: dict[str, Any], comments: str, fallback_prompt: str | None = None, **updates: Any) -> dict[str, Any]:
         settings = dict(source_media.get("settings", {}) or {})
+        if fallback_prompt is not None and (len(settings) == 0 or str(settings.get("model_type", "") or "").strip() == "Deepy"):
+            return self._build_deepy_settings(fallback_prompt, comments, **updates)
         settings["client_id"] = _next_ai_client_id()
+        self._remember_generated_client_id(settings["client_id"])
         settings["comments"] = str(comments or "").strip()
         end_time = time.time()
         settings["creation_date"] = datetime.fromtimestamp(end_time).isoformat(timespec="seconds")
@@ -992,19 +1523,7 @@ class tools:
         return settings
 
     def _build_direct_image_settings(self, comments: str, width: int, height: int, **updates: Any) -> dict[str, Any]:
-        end_time = time.time()
-        settings = {
-            "client_id": _next_ai_client_id(),
-            "comments": str(comments or "").strip(),
-            "creation_date": datetime.fromtimestamp(end_time).isoformat(timespec="seconds"),
-            "creation_timestamp": int(end_time),
-            "image_mode": 1,
-            "resolution": f"{int(width)}x{int(height)}",
-        }
-        for key, value in updates.items():
-            if value is not None:
-                settings[key] = value
-        return settings
+        return self._build_deepy_settings(updates.pop("prompt", f"An image at {int(width)}x{int(height)}."), comments, image_mode=1, resolution=f"{int(width)}x{int(height)}", **updates)
 
     def _update_video_metadata_fields(self, output_path: str, settings: dict[str, Any]) -> None:
         try:
@@ -1040,10 +1559,14 @@ class tools:
         self.send_cmd("load_queue_trigger", {"client_id": client_id})
         self._log(f"Queued {activity_label} for {client_id}")
 
-        queue_detect_deadline = time.time() + 5
-        while time.time() < queue_detect_deadline:
+        queue_admitted = False
+        queue_wait_started_at = time.time()
+        queue_wait_suspended = False
+        queue_wait_suspend_logged = False
+        activity_console_label = activity_label.capitalize()
+        while True:
             if self._is_interrupted():
-                return self._interrupted_result(client_id, task)
+                return self._interrupted_result(client_id, task, force_cancel_queue=True)
             queue_errors = gen.get("queue_errors", None) or {}
             if client_id in queue_errors:
                 error_text = str(queue_errors[client_id][0])
@@ -1059,16 +1582,32 @@ class tools:
                 }
                 self._update_tool_progress("error", "Error", result)
                 return result
-            queue = list(gen.get("queue", []) or [])
-            if self._queue_contains_client_id(queue, client_id):
+            file_list, file_settings_list, audio_file_list, audio_file_settings_list = self.get_processed_queue(gen)
+            media_file_list = list(audio_file_list or []) if gallery_media_type == "audio" else list(file_list or [])
+            media_settings_list = list(audio_file_settings_list or []) if gallery_media_type == "audio" else list(file_settings_list or [])
+            file_path, file_settings = media_registry.find_last_gallery_media_by_client(media_file_list, media_settings_list, client_id, media_type=gallery_media_type)
+            if file_path is not None and isinstance(file_settings, dict):
+                self._log(f"{activity_label.capitalize()} already completed before queue admission wait observed for {client_id}; skipping browser-style queue admission wait.")
                 self._set_status(f"{activity_label.capitalize()} started...", kind="tool")
                 self._update_tool_progress("running", "Running", {"status": "running", "client_id": client_id, "prompt": prompt, "resolution": resolution})
                 break
+            queue = list(gen.get("queue", []) or [])
+            if self._queue_contains_client_id(queue, client_id):
+                queue_admitted = True
+                if queue_wait_suspended:
+                    print(f"WanGP back in focus tool {activity_console_label} resumed")
+                self._set_status(f"{activity_label.capitalize()} started...", kind="tool")
+                self._update_tool_progress("running", "Running", {"status": "running", "client_id": client_id, "prompt": prompt, "resolution": resolution})
+                break
+            if not queue_wait_suspend_logged and time.time() - queue_wait_started_at >= 10:
+                print(f"Tool {activity_console_label} suspended while waiting than WanGP Video Generator gets in focus")
+                queue_wait_suspend_logged = True
+                queue_wait_suspended = True
             time.sleep(0.25)
 
         while True:
             if self._is_interrupted():
-                return self._interrupted_result(client_id, task)
+                return self._interrupted_result(client_id, task, force_cancel_queue=True)
             queue_errors = gen.get("queue_errors", None) or {}
             if client_id in queue_errors:
                 error_text = str(queue_errors[client_id][0])
@@ -1126,16 +1665,92 @@ class tools:
             return result
 
     @assistant_tool(
+        display_name="Get Loras",
+        description="List the available LoRA filenames for one of Deepy's 6 generation tools.",
+        parameters={
+            "tool_id": {
+                "type": "string",
+                "description": "Generation tool id: gen_image, edit_image, gen_video, gen_video_with_speech, gen_speech_from_description, or gen_speech_from_sample.",
+                "enum": list(deepy_tool_settings.GENERATION_TOOL_IDS),
+            },
+        },
+        pause_runtime=False,
+    )
+    def get_loras(self, tool_id: str) -> dict[str, Any]:
+        lookup_name = str(tool_id or "").strip()
+        if lookup_name not in deepy_tool_settings.GENERATION_TOOL_IDS:
+            return {
+                "status": "error",
+                "tool_id": lookup_name,
+                "loras": [],
+                "count": 0,
+                "error": f"tool_id must be one of: {', '.join(deepy_tool_settings.GENERATION_TOOL_IDS)}.",
+            }
+        generator_variant = self.get_tool_variant(lookup_name)
+        template_file = self.get_tool_template_filename(lookup_name)
+        try:
+            loras = deepy_tool_settings.list_tool_loras(lookup_name, generator_variant)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "tool_id": lookup_name,
+                "generator_variant": generator_variant,
+                "template_file": template_file,
+                "loras": [],
+                "count": 0,
+                "error": str(exc),
+            }
+        return {
+            "status": "ok",
+            "tool_id": lookup_name,
+            "generator_variant": generator_variant,
+            "template_file": template_file,
+            "loras": loras,
+            "count": len(loras),
+        }
+
+    @assistant_tool(
+        display_name="Get Default Settings",
+        description="Return the effective default generation settings for one of Deepy's 6 generation tools: the values that WanGP will use if those settings are omitted during generation.",
+        parameters={
+            "tool_id": {
+                "type": "string",
+                "description": "Generation tool id: gen_image, edit_image, gen_video, gen_video_with_speech, gen_speech_from_description, or gen_speech_from_sample.",
+                "enum": list(deepy_tool_settings.GENERATION_TOOL_IDS),
+            },
+        },
+        pause_runtime=False,
+    )
+    def get_default_settings(self, tool_id: str) -> dict[str, Any]:
+        result, error_result = self._get_effective_generation_defaults(tool_id)
+        return result if error_result is None else error_result
+
+    @assistant_tool(
         display_name="Generate Image",
         description="Queue and generate an image from a text prompt inside WanGP, then wait until the output image is available.",
         parameters={
             "prompt": {
                 "type": "string",
                 "description": "The image generation prompt to send to WanGP.",
-            }
+            },
+            "width": {
+                "type": "integer",
+                "description": "Optional output width in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "height": {
+                "type": "integer",
+                "description": "Optional output height in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "num_inference_steps": {
+                "type": "integer",
+                "description": "Optional number of inference steps. If omitted, keep the template step count.",
+                "required": False,
+            },
         },
     )
-    def gen_image(self, prompt: str) -> dict[str, Any]:
+    def gen_image(self, prompt: str, width: int | None = None, height: int | None = None, num_inference_steps: int | None = None) -> dict[str, Any]:
         client_id = _next_ai_client_id()
         generator_variant = self._get_tool_ui_settings()["image_generator_variant"]
         template_file = self.get_tool_template_filename("gen_image")
@@ -1145,7 +1760,12 @@ class tools:
             if len(template_file) > 0:
                 error_result["template_file"] = template_file
             return error_result
-        task = self._apply_generation_overrides(task, include_num_frames=False)
+        task, error_result = self._apply_generation_overrides("gen_image", task, include_num_frames=False, width=width, height=height, num_inference_steps=num_inference_steps)
+        if error_result is not None:
+            error_result["generator_variant"] = generator_variant
+            if len(template_file) > 0:
+                error_result["template_file"] = template_file
+            return error_result
         if len(task["prompt"]) == 0:
             self._set_status("Image generation failed: prompt is empty.", kind="error")
             return {
@@ -1180,9 +1800,64 @@ class tools:
                 "description": "Optional media id of the end image returned by Resolve Media.",
                 "required": False,
             },
+            "width": {
+                "type": "integer",
+                "description": "Optional output width in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "height": {
+                "type": "integer",
+                "description": "Optional output height in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "num_frames": {
+                "type": "integer",
+                "description": "Optional output frame count. If omitted, use the current Deepy/template setting.",
+                "required": False,
+            },
+            "duration_seconds": {
+                "type": "number",
+                "description": "Optional output duration in seconds. Deepy converts it to num_frames using the effective FPS. Do not pass this together with num_frames.",
+                "required": False,
+            },
+            "fps": {
+                "type": "integer",
+                "description": "Optional output FPS between 15 and 60. If omitted, keep the template FPS behavior.",
+                "required": False,
+            },
+            "num_inference_steps": {
+                "type": "integer",
+                "description": "Optional number of inference steps. If omitted, keep the template step count.",
+                "required": False,
+            },
+            "loras": {
+                "type": "array",
+                "description": "Optional list of LoRA filenames to apply. Each item must include `name` and may include `multiplier` as a number like 0.8 or a WanGP multiplier string like `0;1`. Omitted multipliers default to 1.",
+                "required": False,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "LoRA filename returned by Get Loras."},
+                        "multiplier": {"description": "Optional LoRA multiplier. Accepts a number or a WanGP multiplier string."},
+                    },
+                    "required": ["name"],
+                },
+            },
         },
     )
-    def gen_video(self, prompt: str, image_start: str | None = None, image_end: str | None = None) -> dict[str, Any]:
+    def gen_video(
+        self,
+        prompt: str,
+        image_start: str | None = None,
+        image_end: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        num_frames: int | None = None,
+        duration_seconds: float | None = None,
+        fps: int | None = None,
+        num_inference_steps: int | None = None,
+        loras: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         self._sync_recent_media()
         start_media, error_result = self._resolve_image_media(image_start or "", "image_start")
         if error_result is not None:
@@ -1212,7 +1887,35 @@ class tools:
             if end_media is not None:
                 error_result["source_end_media_id"] = end_media.get("media_id", "")
             return error_result
-        task = self._apply_generation_overrides(task, include_num_frames=True)
+        try:
+            task = deepy_tool_settings.apply_tool_loras("gen_video", generator_variant, task, loras)
+        except Exception as exc:
+            error_result = {
+                "status": "error",
+                "client_id": client_id,
+                "output_file": "",
+                "prompt": str(prompt or "").strip(),
+                "resolution": str(task.get("resolution", "") or "").strip(),
+                "error": str(exc),
+            }
+            error_result["generator_variant"] = generator_variant
+            if len(template_file) > 0:
+                error_result["template_file"] = template_file
+            if start_media is not None:
+                error_result["source_start_media_id"] = start_media.get("media_id", "")
+            if end_media is not None:
+                error_result["source_end_media_id"] = end_media.get("media_id", "")
+            return error_result
+        task, error_result = self._apply_generation_overrides("gen_video", task, include_num_frames=True, width=width, height=height, num_frames=num_frames, duration_seconds=duration_seconds, fps=fps, num_inference_steps=num_inference_steps)
+        if error_result is not None:
+            error_result["generator_variant"] = generator_variant
+            if len(template_file) > 0:
+                error_result["template_file"] = template_file
+            if start_media is not None:
+                error_result["source_start_media_id"] = start_media.get("media_id", "")
+            if end_media is not None:
+                error_result["source_end_media_id"] = end_media.get("media_id", "")
+            return error_result
         if len(task["prompt"]) == 0:
             self._set_status("Video generation failed: prompt is empty.", kind="error")
             return {
@@ -1249,9 +1952,64 @@ class tools:
                 "type": "string",
                 "description": "The media id of the speech audio returned by Resolve Media.",
             },
+            "width": {
+                "type": "integer",
+                "description": "Optional output width in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "height": {
+                "type": "integer",
+                "description": "Optional output height in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "num_frames": {
+                "type": "integer",
+                "description": "Optional output frame count. If omitted, use the current Deepy/template setting.",
+                "required": False,
+            },
+            "duration_seconds": {
+                "type": "number",
+                "description": "Optional output duration in seconds. Deepy converts it to num_frames using the effective FPS. Do not pass this together with num_frames.",
+                "required": False,
+            },
+            "fps": {
+                "type": "integer",
+                "description": "Optional output FPS between 15 and 60. If omitted, keep the template FPS behavior.",
+                "required": False,
+            },
+            "num_inference_steps": {
+                "type": "integer",
+                "description": "Optional number of inference steps. If omitted, keep the template step count.",
+                "required": False,
+            },
+            "loras": {
+                "type": "array",
+                "description": "Optional list of LoRA filenames to apply. Each item must include `name` and may include `multiplier` as a number like 0.8 or a WanGP multiplier string like `0;1`. Omitted multipliers default to 1.",
+                "required": False,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "LoRA filename returned by Get Loras."},
+                        "multiplier": {"description": "Optional LoRA multiplier. Accepts a number or a WanGP multiplier string."},
+                    },
+                    "required": ["name"],
+                },
+            },
         },
     )
-    def gen_video_with_speech(self, prompt: str, image_start: str, audio_media_id: str) -> dict[str, Any]:
+    def gen_video_with_speech(
+        self,
+        prompt: str,
+        image_start: str,
+        audio_media_id: str,
+        width: int | None = None,
+        height: int | None = None,
+        num_frames: int | None = None,
+        duration_seconds: float | None = None,
+        fps: int | None = None,
+        num_inference_steps: int | None = None,
+        loras: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         self._sync_recent_media()
         start_media, error_result = self._resolve_image_media(image_start, "image_start")
         if error_result is not None:
@@ -1281,7 +2039,33 @@ class tools:
             error_result["source_audio_media_id"] = audio_media.get("media_id", "")
             error_result["image_start_target"] = self._get_image_start_target("gen_video_with_speech")
             return error_result
-        task = self._apply_generation_overrides(task, include_num_frames=True)
+        try:
+            task = deepy_tool_settings.apply_tool_loras("gen_video_with_speech", generator_variant, task, loras)
+        except Exception as exc:
+            error_result = {
+                "status": "error",
+                "client_id": client_id,
+                "output_file": "",
+                "prompt": str(prompt or "").strip(),
+                "resolution": str(task.get("resolution", "") or "").strip(),
+                "error": str(exc),
+            }
+            error_result["generator_variant"] = generator_variant
+            if len(template_file) > 0:
+                error_result["template_file"] = template_file
+            error_result["source_start_media_id"] = start_media.get("media_id", "")
+            error_result["source_audio_media_id"] = audio_media.get("media_id", "")
+            error_result["image_start_target"] = self._get_image_start_target("gen_video_with_speech")
+            return error_result
+        task, error_result = self._apply_generation_overrides("gen_video_with_speech", task, include_num_frames=True, width=width, height=height, num_frames=num_frames, duration_seconds=duration_seconds, fps=fps, num_inference_steps=num_inference_steps)
+        if error_result is not None:
+            error_result["generator_variant"] = generator_variant
+            if len(template_file) > 0:
+                error_result["template_file"] = template_file
+            error_result["source_start_media_id"] = start_media.get("media_id", "")
+            error_result["source_audio_media_id"] = audio_media.get("media_id", "")
+            error_result["image_start_target"] = self._get_image_start_target("gen_video_with_speech")
+            return error_result
         if len(task["prompt"]) == 0:
             self._set_status("Video generation failed: prompt is empty.", kind="error")
             return {
@@ -1432,9 +2216,31 @@ class tools:
                 "type": "string",
                 "description": "The instruction prompt describing how to modify the image.",
             },
+            "width": {
+                "type": "integer",
+                "description": "Optional output width in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "height": {
+                "type": "integer",
+                "description": "Optional output height in pixels. Only pass this when the user explicitly asks for output size; otherwise omit it and use the current Deepy/template setting.",
+                "required": False,
+            },
+            "num_inference_steps": {
+                "type": "integer",
+                "description": "Optional number of inference steps. If omitted, keep the template step count.",
+                "required": False,
+            },
         },
     )
-    def edit_image(self, media_id: str, prompt: str) -> dict[str, Any]:
+    def edit_image(
+        self,
+        media_id: str,
+        prompt: str,
+        width: int | None = None,
+        height: int | None = None,
+        num_inference_steps: int | None = None,
+    ) -> dict[str, Any]:
         self._sync_recent_media()
         if self.session is None:
             return {"status": "error", "media_id": str(media_id or "").strip(), "prompt": str(prompt or "").strip(), "output_file": "", "error": "Assistant session is not available."}
@@ -1466,7 +2272,13 @@ class tools:
                 error_result["template_file"] = template_file
             error_result["media_id"] = media_record.get("media_id", "")
             return error_result
-        task = self._apply_generation_overrides(task, include_num_frames=False)
+        task, error_result = self._apply_generation_overrides("edit_image", task, include_num_frames=False, width=width, height=height, num_inference_steps=num_inference_steps)
+        if error_result is not None:
+            error_result["editor_variant"] = editor_variant
+            if len(template_file) > 0:
+                error_result["template_file"] = template_file
+            error_result["media_id"] = media_record.get("media_id", "")
+            return error_result
         if len(task["prompt"]) == 0:
             return {
                 "status": "error",
@@ -1532,8 +2344,8 @@ class tools:
             self._update_tool_progress("error", "Error", result)
             self._set_status(f"Color frame creation failed: {exc}", kind="error")
             return result
-        settings = self._build_direct_image_settings(f'Created solid {resolved_color} image at {width}x{height}', width, height, prompt=f"Solid {resolved_color} image", seed=-1)
-        media_record = self._record_direct_media(output_path, settings, is_image=True, audio_only=False, label="Color frame", persist_metadata=False)
+        settings = self._build_direct_image_settings(f'Created solid {resolved_color} image at {width}x{height}', width, height, prompt=f"A solid {resolved_color} image at {width}x{height}.")
+        media_record = self._record_direct_media(output_path, settings, is_image=True, audio_only=False, label="Color frame")
         result = {
             "status": "done",
             "media_id": "" if media_record is None else media_record.get("media_id", ""),
@@ -1609,7 +2421,8 @@ class tools:
             self._set_status(f"Image extraction failed: {exc}", kind="error")
             return result
         comments = f'Extracted frame {resolved_frame_no} from "{os.path.basename(source_path)}"' if time_seconds is None else f'Extracted frame {resolved_frame_no} at {time_seconds:.3f}s from "{os.path.basename(source_path)}"'
-        extracted_settings = self._build_direct_media_settings(source_media, comments)
+        prompt_summary = f"An image extracted from a video at {time_seconds:.3f} seconds." if time_seconds is not None else f"An image extracted from frame {resolved_frame_no} of a video."
+        extracted_settings = self._build_direct_media_settings(source_media, comments, fallback_prompt=prompt_summary)
         media_record = self._record_direct_media(output_path, extracted_settings, is_image=True, audio_only=False, label="Extracted image")
         result = {
             "status": "done",
@@ -1626,7 +2439,7 @@ class tools:
 
     @assistant_tool(
         display_name="Extract Video",
-        description="Extract a video segment from a previously resolved video using start_time and either end_time or duration.",
+        description="Extract a video segment from a previously resolved video using either time-based arguments (start_time, end_time, duration) or frame-based arguments (start_frame, end_frame, num_frames).",
         parameters={
             "media_id": {
                 "type": "string",
@@ -1634,7 +2447,8 @@ class tools:
             },
             "start_time": {
                 "type": "number",
-                "description": "Start time in seconds.",
+                "description": "Optional start time in seconds. Defaults to the beginning when only end_time or duration is provided.",
+                "required": False,
             },
             "end_time": {
                 "type": "number",
@@ -1646,66 +2460,135 @@ class tools:
                 "description": "Optional segment duration in seconds.",
                 "required": False,
             },
+            "start_frame": {
+                "type": "integer",
+                "description": "Optional start frame number. Defaults to frame 0 when only end_frame or num_frames is provided.",
+                "required": False,
+            },
+            "end_frame": {
+                "type": "integer",
+                "description": "Optional inclusive end frame number.",
+                "required": False,
+            },
+            "num_frames": {
+                "type": "integer",
+                "description": "Optional number of frames to keep from start_frame.",
+                "required": False,
+            },
         },
         pause_runtime=False,
     )
-    def extract_video(self, media_id: str, start_time: float, end_time: float | None = None, duration: float | None = None) -> dict[str, Any]:
+    def extract_video(
+        self,
+        media_id: str,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        duration: float | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        num_frames: int | None = None,
+    ) -> dict[str, Any]:
         self._sync_recent_media()
         source_media, error_result = self._resolve_video_media(media_id, "media_id")
         if error_result is not None:
             return error_result
-        start_time, error_result = self._parse_time_value(start_time, "start_time", required=True)
+        segment_args, error_result = self._resolve_segment_args(
+            source_media,
+            start_time=start_time,
+            end_time=end_time,
+            duration=duration,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            num_frames=num_frames,
+        )
         if error_result is not None:
             error_result.update({"media_id": source_media.get("media_id", ""), "output_file": ""})
             return error_result
-        end_time, error_result = self._parse_time_value(end_time, "end_time")
-        if error_result is not None:
-            error_result.update({"media_id": source_media.get("media_id", ""), "output_file": ""})
-            return error_result
-        duration, error_result = self._parse_time_value(duration, "duration")
-        if error_result is not None:
-            error_result.update({"media_id": source_media.get("media_id", ""), "output_file": ""})
-            return error_result
-        if end_time is not None and duration is not None:
-            return {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": "Specify either end_time or duration, not both."}
         self._set_status("Extracting video...", kind="tool")
-        self._update_tool_progress("running", "Extracting", {"status": "running", "media_id": source_media.get("media_id", ""), "start_time": start_time, "end_time": end_time, "duration": duration})
+        progress_payload = {
+            "status": "running",
+            "media_id": source_media.get("media_id", ""),
+            "mode": segment_args["mode"],
+            "start_time": segment_args["start_time"],
+            "end_time": segment_args["end_time"],
+            "duration": segment_args["duration"],
+        }
+        if segment_args["mode"] == "frame":
+            progress_payload.update({"start_frame": segment_args["start_frame"], "end_frame": segment_args["end_frame"], "num_frames": segment_args["num_frames"]})
+        self._update_tool_progress("running", "Extracting", progress_payload)
         source_path = str(source_media.get("path", "")).strip()
         video_codec, video_container = self._get_video_output_settings()
         base_name = os.path.splitext(os.path.basename(source_path))[0]
         output_path = self._resolve_direct_output_path(f"{base_name}_clip{deepy_video_tools.get_video_container_extension(video_container)}", False, False)
         try:
-            output_path = deepy_video_tools.extract_video(source_path, output_path, start_time=start_time, end_time=end_time, duration=duration, video_codec=video_codec, video_container=video_container, audio_codec=self._get_video_audio_output_codec())
+            output_path = deepy_video_tools.extract_video(
+                source_path,
+                output_path,
+                start_time=segment_args["start_time"],
+                end_time=segment_args["end_time"],
+                duration=segment_args["duration"],
+                video_codec=video_codec,
+                video_container=video_container,
+                audio_codec=self._get_video_audio_output_codec(),
+            )
         except Exception as exc:
             result = {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": str(exc)}
             self._update_tool_progress("error", "Error", result)
             self._set_status(f"Video extraction failed: {exc}", kind="error")
             return result
-        comments = f'Extracted video segment from "{os.path.basename(source_path)}" starting at {start_time}s'
-        if end_time is not None:
-            comments += f" ending at {end_time}s"
-        elif duration is not None:
-            comments += f" with duration {duration}s"
-        extracted_settings = self._build_direct_media_settings(source_media, comments)
+        if segment_args["mode"] == "frame":
+            comments = f'Extracted video segment from "{os.path.basename(source_path)}" starting at frame {segment_args["start_frame"]} ({segment_args["start_time"]:.3f}s)'
+            if start_frame is None and (end_frame is not None or num_frames is not None):
+                comments = f'Extracted video segment from "{os.path.basename(source_path)}" starting at the beginning'
+            if num_frames is not None:
+                comments += f" with {segment_args['num_frames']} frame"
+                if segment_args["num_frames"] != 1:
+                    comments += "s"
+            elif end_frame is not None:
+                comments += f" ending at frame {segment_args['end_frame']} ({segment_args['end_time']:.3f}s)"
+            else:
+                comments += " through the end of the video"
+        else:
+            comments = f'Extracted video segment from "{os.path.basename(source_path)}" starting at {segment_args["start_time"]:.3f}s'
+            if start_time is None and (end_time is not None or duration is not None):
+                comments = f'Extracted video segment from "{os.path.basename(source_path)}" starting at the beginning'
+            if segment_args["end_time"] is not None:
+                comments += f" ending at {segment_args['end_time']:.3f}s"
+            elif segment_args["duration"] is not None:
+                comments += f" with duration {segment_args['duration']:.3f}s"
+        prompt_summary = f"Audio extracted from a source media item."
+        if audio_track_no is not None:
+            prompt_summary = f"Audio extracted from track {audio_track_no} of a source media item."
+        if segment_args["mode"] == "frame" and (start_frame is not None or end_frame is not None or num_frames is not None):
+            prompt_summary += f" Keep audio aligned to frames starting at {segment_args['start_frame']}."
+        elif segment_args["start_time"] is not None or segment_args["end_time"] is not None or segment_args["duration"] is not None:
+            if segment_args["end_time"] is not None:
+                prompt_summary += f" From {segment_args['start_time']:.3f} to {segment_args['end_time']:.3f} seconds."
+            elif segment_args["duration"] is not None:
+                prompt_summary += f" Starting at {segment_args['start_time']:.3f} seconds for {segment_args['duration']:.3f} seconds."
+        extracted_settings = self._build_direct_media_settings(source_media, comments, fallback_prompt=prompt_summary)
         self._update_video_metadata_fields(output_path, extracted_settings)
         media_record = self._record_direct_media(output_path, extracted_settings, is_image=False, audio_only=False, label="Extracted video")
         result = {
             "status": "done",
             "media_id": "" if media_record is None else media_record.get("media_id", ""),
             "source_media_id": source_media.get("media_id", ""),
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration": duration,
+            "mode": segment_args["mode"],
+            "start_time": segment_args["start_time"],
+            "end_time": segment_args["end_time"],
+            "duration": segment_args["duration"],
             "output_file": output_path,
             "error": "",
         }
+        if segment_args["mode"] == "frame":
+            result.update({"start_frame": segment_args["start_frame"], "end_frame": segment_args["end_frame"], "num_frames": segment_args["num_frames"]})
         self._update_tool_progress("done", "Done", result)
         self._set_status("Video extracted.", kind="tool")
         return result
 
     @assistant_tool(
         display_name="Extract Audio",
-        description="Extract audio from a previously resolved video or audio file using optional start_time, end_time, duration, and audio_track_no.",
+        description="Extract audio from a previously resolved video or audio file using either time-based arguments (start_time, end_time, duration) or, for video sources, frame-based arguments (start_frame, end_frame, num_frames).",
         parameters={
             "media_id": {
                 "type": "string",
@@ -1726,6 +2609,21 @@ class tools:
                 "description": "Optional segment duration in seconds.",
                 "required": False,
             },
+            "start_frame": {
+                "type": "integer",
+                "description": "Optional start frame number when media_id refers to a video. Defaults to frame 0 when only end_frame or num_frames is provided.",
+                "required": False,
+            },
+            "end_frame": {
+                "type": "integer",
+                "description": "Optional inclusive end frame number when media_id refers to a video.",
+                "required": False,
+            },
+            "num_frames": {
+                "type": "integer",
+                "description": "Optional number of source video frames to keep when media_id refers to a video.",
+                "required": False,
+            },
             "audio_track_no": {
                 "type": "integer",
                 "description": "Optional 1-based audio track number to extract. Defaults to 1.",
@@ -1734,7 +2632,17 @@ class tools:
         },
         pause_runtime=False,
     )
-    def extract_audio(self, media_id: str, start_time: float | None = None, end_time: float | None = None, duration: float | None = None, audio_track_no: int | None = None) -> dict[str, Any]:
+    def extract_audio(
+        self,
+        media_id: str,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        duration: float | None = None,
+        start_frame: int | None = None,
+        end_frame: int | None = None,
+        num_frames: int | None = None,
+        audio_track_no: int | None = None,
+    ) -> dict[str, Any]:
         self._sync_recent_media()
         if self.session is None:
             return {"status": "error", "media_id": str(media_id or "").strip(), "output_file": "", "error": "Assistant session is not available."}
@@ -1744,15 +2652,16 @@ class tools:
         if source_media.get("media_type") not in {"audio", "video"}:
             actual_media_type = str(source_media.get("media_type", "") or "").strip() or "unknown media type"
             return {"status": "error", "media_id": source_media.get("media_id", ""), "actual_media_type": actual_media_type, "media_type": actual_media_type, "output_file": "", "error": f"media_id must reference audio or video, not a {actual_media_type}."}
-        start_time, error_result = self._parse_time_value(start_time, "start_time")
-        if error_result is not None:
-            error_result.update({"media_id": source_media.get("media_id", ""), "output_file": ""})
-            return error_result
-        end_time, error_result = self._parse_time_value(end_time, "end_time")
-        if error_result is not None:
-            error_result.update({"media_id": source_media.get("media_id", ""), "output_file": ""})
-            return error_result
-        duration, error_result = self._parse_time_value(duration, "duration")
+        segment_args, error_result = self._resolve_segment_args(
+            source_media,
+            start_time=start_time,
+            end_time=end_time,
+            duration=duration,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            num_frames=num_frames,
+            allow_empty=True,
+        )
         if error_result is not None:
             error_result.update({"media_id": source_media.get("media_id", ""), "output_file": ""})
             return error_result
@@ -1762,16 +2671,33 @@ class tools:
             return {"status": "error", "media_id": source_media.get("media_id", ""), "audio_track_no": audio_track_no, "output_file": "", "error": "audio_track_no must be an integer."}
         if audio_track_no is not None and audio_track_no <= 0:
             return {"status": "error", "media_id": source_media.get("media_id", ""), "audio_track_no": audio_track_no, "output_file": "", "error": "audio_track_no must be >= 1."}
-        if end_time is not None and duration is not None:
-            return {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": "Specify either end_time or duration, not both."}
         self._set_status("Extracting audio...", kind="tool")
-        self._update_tool_progress("running", "Extracting", {"status": "running", "media_id": source_media.get("media_id", ""), "start_time": start_time, "end_time": end_time, "duration": duration, "audio_track_no": audio_track_no})
+        progress_payload = {
+            "status": "running",
+            "media_id": source_media.get("media_id", ""),
+            "mode": segment_args["mode"],
+            "start_time": segment_args["start_time"],
+            "end_time": segment_args["end_time"],
+            "duration": segment_args["duration"],
+            "audio_track_no": audio_track_no,
+        }
+        if segment_args["mode"] == "frame":
+            progress_payload.update({"start_frame": segment_args["start_frame"], "end_frame": segment_args["end_frame"], "num_frames": segment_args["num_frames"]})
+        self._update_tool_progress("running", "Extracting", progress_payload)
         source_path = str(source_media.get("path", "")).strip()
         base_name = os.path.splitext(os.path.basename(source_path))[0]
         audio_codec = self._get_standalone_audio_output_codec()
         output_path = self._resolve_direct_output_path(f"{base_name}_audio{deepy_video_tools.get_audio_standalone_extension(audio_codec)}", False, True)
         try:
-            output_path = deepy_video_tools.extract_audio(source_path, output_path, start_time=start_time, end_time=end_time, duration=duration, audio_track_no=audio_track_no, audio_codec=audio_codec)
+            output_path = deepy_video_tools.extract_audio(
+                source_path,
+                output_path,
+                start_time=segment_args["start_time"],
+                end_time=segment_args["end_time"],
+                duration=segment_args["duration"],
+                audio_track_no=audio_track_no,
+                audio_codec=audio_codec,
+            )
         except Exception as exc:
             result = {"status": "error", "media_id": source_media.get("media_id", ""), "audio_track_no": audio_track_no, "output_file": "", "error": str(exc)}
             self._update_tool_progress("error", "Error", result)
@@ -1780,12 +2706,28 @@ class tools:
         comments = f'Extracted audio from "{os.path.basename(source_path)}"'
         if audio_track_no is not None:
             comments += f" using audio track {audio_track_no}"
-        if start_time is not None:
-            comments += f" starting at {start_time}s"
-        if end_time is not None:
-            comments += f" ending at {end_time}s"
-        elif duration is not None:
-            comments += f" with duration {duration}s"
+        if segment_args["mode"] == "frame":
+            if start_frame is not None or end_frame is not None or num_frames is not None:
+                comments += f" starting at frame {segment_args['start_frame']} ({segment_args['start_time']:.3f}s)"
+                if start_frame is None and (end_frame is not None or num_frames is not None):
+                    comments = comments.replace(f" starting at frame {segment_args['start_frame']} ({segment_args['start_time']:.3f}s)", " starting at the beginning")
+                if num_frames is not None:
+                    comments += f" with {segment_args['num_frames']} frame"
+                    if segment_args["num_frames"] != 1:
+                        comments += "s"
+                elif end_frame is not None:
+                    comments += f" ending at frame {segment_args['end_frame']} ({segment_args['end_time']:.3f}s)"
+                else:
+                    comments += " through the end of the source"
+        else:
+            if segment_args["start_time"] is not None:
+                comments += f" starting at {segment_args['start_time']:.3f}s"
+                if start_time is None and (end_time is not None or duration is not None):
+                    comments = comments.replace(f" starting at {segment_args['start_time']:.3f}s", " starting at the beginning")
+            if segment_args["end_time"] is not None:
+                comments += f" ending at {segment_args['end_time']:.3f}s"
+            elif segment_args["duration"] is not None:
+                comments += f" with duration {segment_args['duration']:.3f}s"
         extracted_settings = self._build_direct_media_settings(source_media, comments)
         self._update_audio_metadata_fields(output_path, extracted_settings)
         media_record = self._record_direct_media(output_path, extracted_settings, is_image=False, audio_only=True, label="Extracted audio")
@@ -1793,15 +2735,115 @@ class tools:
             "status": "done",
             "media_id": "" if media_record is None else media_record.get("media_id", ""),
             "source_media_id": source_media.get("media_id", ""),
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration": duration,
+            "mode": segment_args["mode"],
+            "start_time": segment_args["start_time"],
+            "end_time": segment_args["end_time"],
+            "duration": segment_args["duration"],
             "audio_track_no": 1 if audio_track_no is None else audio_track_no,
             "output_file": output_path,
             "error": "",
         }
+        if segment_args["mode"] == "frame":
+            result.update({"start_frame": segment_args["start_frame"], "end_frame": segment_args["end_frame"], "num_frames": segment_args["num_frames"]})
         self._update_tool_progress("done", "Done", result)
         self._set_status("Audio extracted.", kind="tool")
+        return result
+
+    @assistant_tool(
+        display_name="Transcribe Media",
+        description="Transcribe the spoken content of a previously resolved audio or video media item with Whisper medium, returning segment timestamps by default and optionally using word timestamps instead.",
+        parameters={
+            "media_id": {
+                "type": "string",
+                "description": "The media id for the source audio or video returned by Resolve Media.",
+            },
+            "timestamp_type": {
+                "type": "string",
+                "description": "Optional timestamp detail to include. Use `segment` for segment timestamps, `word` for word timestamps, or `none` to disable timestamps. If omitted, segment timestamps are returned.",
+                "required": False,
+            },
+            "audio_track_no": {
+                "type": "integer",
+                "description": "Optional 1-based audio track number when the source media contains multiple audio tracks.",
+                "required": False,
+            },
+        },
+    )
+    def transcribe_media(self, media_id: str, timestamp_type: str | None = None, audio_track_no: int | None = None) -> dict[str, Any]:
+        self._sync_recent_media()
+        source_media, error_result = self._resolve_audio_or_video_media(media_id, "media_id")
+        if error_result is not None:
+            return error_result
+        try:
+            normalized_timestamp_type = deepy_transcription.normalize_timestamp_type(timestamp_type)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "media_id": str(media_id or "").strip(),
+                "timestamp_type": str(timestamp_type or "").strip(),
+                "error": str(exc),
+            }
+        try:
+            audio_track_no = None if audio_track_no is None or str(audio_track_no).strip() == "" else int(audio_track_no)
+        except Exception:
+            return {
+                "status": "error",
+                "media_id": source_media.get("media_id", ""),
+                "timestamp_type": "" if normalized_timestamp_type is None else normalized_timestamp_type,
+                "audio_track_no": audio_track_no,
+                "error": "audio_track_no must be an integer.",
+            }
+        if audio_track_no is not None and audio_track_no <= 0:
+            return {
+                "status": "error",
+                "media_id": source_media.get("media_id", ""),
+                "timestamp_type": "" if normalized_timestamp_type is None else normalized_timestamp_type,
+                "audio_track_no": audio_track_no,
+                "error": "audio_track_no must be >= 1.",
+            }
+        self._set_status("Transcribing media...", kind="tool")
+        progress_payload = {
+            "status": "running",
+            "media_id": source_media.get("media_id", ""),
+            "media_type": source_media.get("media_type", ""),
+            "timestamp_type": "" if normalized_timestamp_type is None else normalized_timestamp_type,
+        }
+        if audio_track_no is not None:
+            progress_payload["audio_track_no"] = audio_track_no
+        self._update_tool_progress("running", "Transcribing", progress_payload)
+        source_path = str(source_media.get("path", "")).strip()
+        try:
+            payload = deepy_transcription.transcribe_media(source_path, timestamp_type=normalized_timestamp_type, audio_track_no=audio_track_no)
+        except Exception as exc:
+            result = {
+                "status": "error",
+                "media_id": source_media.get("media_id", ""),
+                "label": source_media.get("label", ""),
+                "media_type": source_media.get("media_type", ""),
+                "path": source_path,
+                "filename": os.path.basename(source_path),
+                "timestamp_type": "" if normalized_timestamp_type is None else normalized_timestamp_type,
+                "error": str(exc),
+            }
+            if audio_track_no is not None:
+                result["audio_track_no"] = audio_track_no
+            self._update_tool_progress("error", "Error", result)
+            self._set_status(f"Transcription failed: {exc}", kind="error")
+            return result
+        result = {
+            "status": "done",
+            "media_id": source_media.get("media_id", ""),
+            "label": source_media.get("label", ""),
+            "media_type": source_media.get("media_type", ""),
+            "path": source_path,
+            "filename": os.path.basename(source_path),
+            "error": "",
+            **payload,
+        }
+        if audio_track_no is not None:
+            result["audio_track_no"] = audio_track_no
+        self._update_tool_progress("done", "Done", result)
+        self._set_status("Transcription finished.", kind="tool")
         return result
 
     @assistant_tool(
@@ -1901,7 +2943,7 @@ class tools:
 
     @assistant_tool(
         display_name="Resize Crop",
-        description="Resize and crop a previously resolved image or video in one step. Crop values can be expressed in pixels or percent.",
+        description="Resize and crop a previously resolved image or video in one step. Crop values can be expressed in pixels or percent. When both width and height are provided, aspect ratio is preserved by default by cropping extra area instead of stretching.",
         parameters={
             "media_id": {
                 "type": "string",
@@ -1942,10 +2984,21 @@ class tools:
                 "description": "Crop unit: pixels or percent.",
                 "required": False,
             },
+            "crop_anchor": {
+                "type": "string",
+                "description": "Optional. Defaults to center. Controls which area stays in frame when aspect-ratio-preserving auto-crop trims extra area.",
+                "enum": ["center", "left", "right", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right"],
+                "required": False,
+            },
+            "stretch_to_fit": {
+                "type": "boolean",
+                "description": "Optional. Defaults to false. When width and height are both provided, set this to true only if the user explicitly wants stretching or distortion instead of cropping extra area.",
+                "required": False,
+            },
         },
         pause_runtime=False,
     )
-    def resize_crop(self, media_id: str, width: int | None = None, height: int | None = None, crop_left: float | None = None, crop_top: float | None = None, crop_right: float | None = None, crop_bottom: float | None = None, crop_unit: str | None = None) -> dict[str, Any]:
+    def resize_crop(self, media_id: str, width: int | None = None, height: int | None = None, crop_left: float | None = None, crop_top: float | None = None, crop_right: float | None = None, crop_bottom: float | None = None, crop_unit: str | None = None, crop_anchor: str | None = None, stretch_to_fit: bool | None = None) -> dict[str, Any]:
         self._sync_recent_media()
         if self.session is None:
             return {"status": "error", "media_id": str(media_id or "").strip(), "output_file": "", "error": "Assistant session is not available."}
@@ -1964,39 +3017,66 @@ class tools:
             crop_bottom = 0 if crop_bottom is None or str(crop_bottom).strip() == "" else float(crop_bottom)
         except Exception:
             return {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": "width and height must be integers, crop values must be numbers."}
+        stretch_to_fit, error_result = self._parse_bool_value(stretch_to_fit, "stretch_to_fit")
+        if error_result is not None:
+            error_result["media_id"] = source_media.get("media_id", "")
+            error_result["output_file"] = ""
+            return error_result
+        if stretch_to_fit is None:
+            stretch_to_fit = False
+        preserve_aspect_ratio = not bool(stretch_to_fit)
         crop_unit = str(crop_unit or "pixels").strip().lower() or "pixels"
         if crop_unit not in {"pixels", "percent"}:
             return {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": "crop_unit must be 'pixels' or 'percent'."}
+        crop_anchor = str(crop_anchor or "center").strip().lower().replace("-", "_").replace(" ", "_") or "center"
+        if crop_anchor not in {"center", "left", "right", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right"}:
+            return {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": "crop_anchor must be center, left, right, top, bottom, top_left, top_right, bottom_left, or bottom_right."}
         source_media_type = str(source_media.get("media_type", "") or "").strip() or "media"
         self._set_status(f"Resizing and cropping {source_media_type}...", kind="tool")
-        self._update_tool_progress("running", "Processing", {"status": "running", "media_id": source_media.get("media_id", ""), "width": width, "height": height, "crop_left": crop_left, "crop_top": crop_top, "crop_right": crop_right, "crop_bottom": crop_bottom, "crop_unit": crop_unit})
+        self._update_tool_progress("running", "Processing", {"status": "running", "media_id": source_media.get("media_id", ""), "width": width, "height": height, "crop_left": crop_left, "crop_top": crop_top, "crop_right": crop_right, "crop_bottom": crop_bottom, "crop_unit": crop_unit, "crop_anchor": crop_anchor, "stretch_to_fit": stretch_to_fit, "preserve_aspect_ratio": preserve_aspect_ratio})
         source_path = str(source_media.get("path", "")).strip()
         base_name = os.path.splitext(os.path.basename(source_path))[0]
         try:
             if source_media_type == "video":
                 video_codec, video_container = self._get_video_output_settings()
                 output_path = self._resolve_direct_output_path(f"{base_name}_resized{deepy_video_tools.get_video_container_extension(video_container)}", False, False)
-                output_path = deepy_video_tools.resize_crop_video(source_path, output_path, width=width, height=height, crop_left=crop_left, crop_top=crop_top, crop_right=crop_right, crop_bottom=crop_bottom, crop_unit=crop_unit, video_codec=video_codec, video_container=video_container, audio_codec=self._get_video_audio_output_codec())
+                output_path = deepy_video_tools.resize_crop_video(source_path, output_path, width=width, height=height, crop_left=crop_left, crop_top=crop_top, crop_right=crop_right, crop_bottom=crop_bottom, crop_unit=crop_unit, preserve_aspect_ratio=preserve_aspect_ratio, crop_anchor=crop_anchor, video_codec=video_codec, video_container=video_container, audio_codec=self._get_video_audio_output_codec())
             else:
                 image_ext = os.path.splitext(source_path)[1].lower()
                 if image_ext not in {".png", ".jpg", ".jpeg", ".webp"}:
                     image_ext = ".png"
                 output_path = self._resolve_direct_output_path(f"{base_name}_resized{image_ext}", True, False)
-                output_path = deepy_video_tools.resize_crop_image(source_path, output_path, width=width, height=height, crop_left=crop_left, crop_top=crop_top, crop_right=crop_right, crop_bottom=crop_bottom, crop_unit=crop_unit)
+                output_path = deepy_video_tools.resize_crop_image(source_path, output_path, width=width, height=height, crop_left=crop_left, crop_top=crop_top, crop_right=crop_right, crop_bottom=crop_bottom, crop_unit=crop_unit, preserve_aspect_ratio=preserve_aspect_ratio, crop_anchor=crop_anchor)
         except Exception as exc:
             result = {"status": "error", "media_id": source_media.get("media_id", ""), "output_file": "", "error": str(exc)}
             self._update_tool_progress("error", "Error", result)
             self._set_status(f"Resize/crop failed: {exc}", kind="error")
             return result
-        comments = f'Resized/cropped "{os.path.basename(source_path)}"'
+        has_manual_crop = any(value > 0 for value in (crop_left, crop_top, crop_right, crop_bottom))
+        uses_aspect_crop = width is not None and height is not None and not stretch_to_fit
+        action_text = "cropped" if has_manual_crop or uses_aspect_crop else "resized" if width is not None or height is not None else "processed"
+        action_label = action_text.capitalize()
+        comments = f'{action_label} "{os.path.basename(source_path)}"'
         if width is not None or height is not None:
             comments += f" to {width if width is not None else 'auto'}x{height if height is not None else 'auto'}"
-        if any(value > 0 for value in (crop_left, crop_top, crop_right, crop_bottom)):
+        if width is not None and height is not None:
+            comments += " with stretching" if stretch_to_fit else " with preserved aspect ratio"
+            if action_text == "cropped" and not stretch_to_fit and crop_anchor != "center":
+                comments += f" anchored {crop_anchor}"
+        if has_manual_crop:
             comments += f" with crop {crop_left}/{crop_top}/{crop_right}/{crop_bottom} {crop_unit}"
-        resized_settings = self._build_direct_media_settings(source_media, comments)
+        prompt_summary = None
+        if source_media_type == "image":
+            if action_text == "cropped":
+                prompt_summary = f"An image cropped to {width if width is not None else 'auto'}x{height if height is not None else 'auto'}."
+                if width is not None and height is not None and crop_anchor != "center":
+                    prompt_summary = f"An image cropped to {width}x{height}, keeping the {crop_anchor.replace('_', ' ')} area."
+            elif action_text == "resized":
+                prompt_summary = f"An image resized to {width if width is not None else 'auto'}x{height if height is not None else 'auto'}."
+        resized_settings = self._build_direct_media_settings(source_media, comments, fallback_prompt=prompt_summary)
         if source_media_type == "video":
             self._update_video_metadata_fields(output_path, resized_settings)
-        media_record = self._record_direct_media(output_path, resized_settings, is_image=source_media_type == "image", audio_only=False, label=f"Resized/cropped {source_media_type}")
+        media_record = self._record_direct_media(output_path, resized_settings, is_image=source_media_type == "image", audio_only=False, label=f"{action_label} {source_media_type}")
         result = {
             "status": "done",
             "media_id": "" if media_record is None else media_record.get("media_id", ""),
@@ -2043,6 +3123,7 @@ class tools:
         output_path = deepy_video_tools.merge_videos(first_path, second_path, output_path=output_path, video_codec=video_codec, video_container=video_container, audio_codec=self._get_video_audio_output_codec())
         merged_settings = dict(second_media.get("settings", {}) or {})
         merged_settings["client_id"] = _next_ai_client_id()
+        self._remember_generated_client_id(merged_settings["client_id"])
         merged_settings["comments"] = f'Merged from "{first_name} & {second_name}"'
         end_time = time.time()
         merged_settings["creation_date"] = datetime.fromtimestamp(end_time).isoformat(timespec="seconds")
@@ -2359,43 +3440,45 @@ class tools:
 
     @assistant_tool(
         display_name="Resolve Media",
-        description="Look up previously generated WanGP media by natural reference such as last image, previous image, or a short description.",
+        description="Look up previously generated WanGP media by a short reference such as 'last', 'previous', or 'selected' plus media_type, or by a short description.",
         parameters={
             "reference": {
                 "type": "string",
-                "description": "The user's natural-language reference to previously generated media, such as 'last image' or 'robot on the moon'.",
+                "description": "The media reference. Use short aliases such as 'last', 'previous', or 'selected' when media_type already specifies image, video, or audio. Descriptive references such as 'robot on the moon' also work.",
             },
             "media_type": {
                 "type": "string",
-                "description": "The desired media type: image, video, audio, or all.",
+                "description": "The desired media type: image, video, audio, or all. Pair this with short references such as reference='last' or reference='selected'.",
             },
         },
         pause_runtime=False,
     )
     def resolve_media_reference(self, reference: str, media_type: str) -> dict[str, Any]:
         self._sync_recent_media()
+        resolved_reference = str(reference or "").strip()
+        resolved_media_type_text = str(media_type or "all").strip() or "all"
         if self.session is None:
-            return {"status": "error", "reference": str(reference or "").strip(), "media_type": str(media_type or "all").strip() or "all", "matches": [], "error": "Assistant session is not available."}
-        if self._is_selected_reference(reference):
-            resolved_media_type = self._normalize_selected_media_type(media_type)
+            return {"status": "error", "reference": resolved_reference, "media_type": resolved_media_type_text, "matches": [], "error": "Assistant session is not available."}
+        if self._is_selected_reference(resolved_reference):
+            resolved_media_type = self._normalize_selected_media_type(media_type, reference=resolved_reference)
             if resolved_media_type == "all":
                 matches = []
                 visual_media_record, audio_media_record, error_result = self._get_all_selected_media_records()
                 if error_result is not None:
-                    error_result.setdefault("reference", str(reference or "").strip())
+                    error_result.setdefault("reference", resolved_reference)
                     return error_result
                 if visual_media_record is not None:
                     matches.append(self._selected_media_payload(visual_media_record, why="matched selected visual media"))
                 if audio_media_record is not None:
                     matches.append(self._selected_media_payload(audio_media_record, why="matched selected audio media"))
                 if len(matches) == 1:
-                    return {"status": "resolved", "media_type": "all", "reference": str(reference or "").strip(), "media": matches[0], "error": ""}
-                return {"status": "candidates", "media_type": "all", "reference": str(reference or "").strip(), "matches": matches, "error": ""}
+                    return {"status": "resolved", "media_type": "all", "reference": resolved_reference, "media": matches[0], "error": ""}
+                return {"status": "candidates", "media_type": "all", "reference": resolved_reference, "matches": matches, "error": ""}
             media_record, error_result = self._get_selected_media_record(resolved_media_type)
             if error_result is not None:
-                error_result.setdefault("reference", str(reference or "").strip())
+                error_result.setdefault("reference", resolved_reference)
                 return error_result
-            return {"status": "resolved", "media_type": resolved_media_type, "reference": str(reference or "").strip(), "media": self._selected_media_payload(media_record, why="matched selected media"), "error": ""}
+            return {"status": "resolved", "media_type": resolved_media_type, "reference": resolved_reference, "media": self._selected_media_payload(media_record, why="matched selected media"), "error": ""}
         result = media_registry.resolve_media_reference(self.session, reference, media_type)
         result.setdefault("error", "")
         return result
@@ -2466,10 +3549,7 @@ class tools:
             required = []
             annotations = getattr(method, "__annotations__", {})
             for param_name, param_meta in metadata["parameters"].items():
-                properties[param_name] = {
-                    "type": param_meta.get("type") or _json_type_from_annotation(annotations.get(param_name, str)),
-                    "description": str(param_meta.get("description", "")).strip(),
-                }
+                properties[param_name] = _build_tool_parameter_schema(annotations, param_name, param_meta)
                 if bool(param_meta.get("required", True)):
                     required.append(param_name)
             schemas.append(
@@ -2768,6 +3848,8 @@ class AssistantEngine:
     def _message_render_content(self, message: dict[str, Any]) -> str:
         model_content = message.get("model_content", None)
         if isinstance(model_content, str) and len(model_content) > 0:
+            if str(message.get("role", "")).strip().lower() == "user":
+                return model_content
             if _INJECT_SELECTED_MEDIA_RUNTIME_UPDATES:
                 return model_content
             return _RUNTIME_UPDATE_BLOCK_RE.sub("\n", model_content).strip()
@@ -2808,64 +3890,168 @@ class AssistantEngine:
     def _pending_tool_render_contents(self) -> list[str]:
         return [self._message_render_content(message).strip() for message in self._get_pending_render_messages() if str(message.get("role", "")).strip().lower() == "tool" and len(self._message_render_content(message).strip()) > 0]
 
-    def _refresh_runtime_status_note(self) -> None:
-        if not _INJECT_SELECTED_MEDIA_RUNTIME_UPDATES:
-            self.session.runtime_status_note = ""
-            self.session.runtime_status_signature = ""
-            return
-        snapshot = self.tool_box._get_selected_runtime_snapshot()
-        previous_snapshot = {}
-        previous_signature = str(self.session.runtime_status_signature or "").strip()
-        if len(previous_signature) > 0:
-            try:
-                previous_snapshot = dict(json.loads(previous_signature) or {})
-            except Exception:
-                previous_snapshot = {}
-        if snapshot is None:
-            if len(previous_signature) == 0:
-                self.session.runtime_status_note = ""
-                return
-            normalized_snapshot = {key: None for key in _RUNTIME_STATUS_ALL_KEYS}
-        else:
-            normalized_snapshot = {key: None for key in _RUNTIME_STATUS_ALL_KEYS}
-            for key in ("selected_visual_media_id", "selected_visual_media_type", "selected_visual_media_label", "selected_audio_media_id", "selected_audio_media_type", "selected_audio_media_label"):
-                normalized_snapshot[key] = str(snapshot.get(key, "") or "").strip() or None
-            for key in ("selected_visual_current_time_seconds", "selected_visual_current_frame_no"):
-                normalized_snapshot[key] = snapshot.get(key, None)
-        signature = _json_dumps(normalized_snapshot)
-        if signature == self.session.runtime_status_signature:
-            self.session.runtime_status_note = ""
-            return
-        changed_keys = [key for key in _RUNTIME_STATUS_ALL_KEYS if previous_snapshot.get(key, None) != normalized_snapshot.get(key, None)]
-        if len(previous_snapshot) == 0:
-            emitted_keys = list(_RUNTIME_STATUS_ALL_KEYS)
-        else:
-            emitted_keys = []
-            if any(key in changed_keys for key in _RUNTIME_STATUS_VISUAL_KEYS):
-                emitted_keys.extend(_RUNTIME_STATUS_VISUAL_KEYS)
-            if any(key in changed_keys for key in _RUNTIME_STATUS_AUDIO_KEYS):
-                emitted_keys.extend(_RUNTIME_STATUS_AUDIO_KEYS)
-            if len(emitted_keys) == 0:
-                self.session.runtime_status_note = ""
-                self.session.runtime_status_signature = signature
-                return
-        lines = [
-            "<wangp_runtime_update>",
-            "Hidden WanGP runtime state. This is environment metadata, not a user message.",
-            "Use it as factual UI context only. Omitted keys keep their previous runtime-update values.",
+    def _get_runtime_tool_template_label(self, tool_name: str) -> str:
+        try:
+            variant = str(self.tool_box.get_tool_variant(tool_name) or "").strip()
+        except Exception:
+            variant = ""
+        if len(variant) == 0:
+            return ""
+        template_label = Path(variant).name.strip()
+        return template_label if len(template_label) > 0 else variant
+
+    def _build_video_tool_runtime_instruction(self, tool_name: str, *, changed: bool) -> str:
+        template_label = self._get_runtime_tool_template_label(tool_name)
+        if len(template_label) == 0:
+            return ""
+        model_def = self.tool_box._get_effective_tool_model_def(tool_name)
+        image_prompt_types_allowed = str(model_def.get("image_prompt_types_allowed", "") or "").strip()
+        sentences = [
+            f"The {tool_name} tool {'has changed and now uses' if changed else 'uses'} Settings '{template_label}'."
         ]
-        for key in emitted_keys:
-            value = normalized_snapshot.get(key, None)
-            if isinstance(value, str):
-                rendered_value = value if len(value) > 0 else "none"
+        if tool_name == "gen_video" and bool(model_def.get("multimedia_generation", False)):
+            sentences.append(
+                "The gen_video tool can generate a video with an audio output from a text prompt. So if the user provides only a text prompt and wants a talking or voiced video, you must use gen_video directly, keep the spoken words in the prompt, and do not call gen_speech_from_description, gen_speech_from_sample, or gen_video_with_speech first."
+            )
+        if "T" in image_prompt_types_allowed:
+            sentences.append(
+                f"The {tool_name} tool can generate a video even if a start image is not provided. So if the user does not provide a start image or asks you explicitly to generate the start image, do not create a start image; just describe the starting situation in the prompt."
+            )
+        elif "S" in image_prompt_types_allowed:
+            sentences.append(
+                f"The {tool_name} tool needs a start image. So if the user does not provide a start image, you will need to create a start image first to use this tool."
+            )
+        return " ".join(sentences).strip()
+
+    def _get_video_tool_runtime_updates(self) -> list[str]:
+        if self.session is None:
+            return []
+        previous_variants = dict(self.session.video_tool_runtime_variants or {})
+        current_variants: dict[str, str] = {}
+        updates = []
+        for tool_name in ("gen_video", "gen_video_with_speech"):
+            variant = str(self.tool_box.get_tool_variant(tool_name) or "").strip()
+            if len(variant) == 0:
+                continue
+            current_variants[tool_name] = variant
+            previous_variant = str(previous_variants.get(tool_name, "") or "").strip()
+            if previous_variant == variant:
+                continue
+            instruction = self._build_video_tool_runtime_instruction(tool_name, changed=len(previous_variant) > 0)
+            if len(instruction) > 0:
+                updates.append(instruction)
+        self.session.video_tool_runtime_variants = current_variants
+        return updates
+
+    def _refresh_runtime_status_note(self) -> None:
+        note_blocks = []
+
+        runtime_lines = []
+
+        runtime_lines.extend(self._get_video_tool_runtime_updates())
+
+        new_user_gallery_media = self.tool_box._get_new_user_gallery_media()
+        if "image" in new_user_gallery_media:
+            instruction = self.tool_box._runtime_media_instruction(
+                new_user_gallery_media["image"],
+                action="added",
+                gallery_label="Image / Video Gallery",
+                reference_label="last",
+                why="matched last user-added image",
+            )
+            if len(instruction) > 0:
+                runtime_lines.append(instruction)
+        if "video" in new_user_gallery_media:
+            instruction = self.tool_box._runtime_media_instruction(
+                new_user_gallery_media["video"],
+                action="added",
+                gallery_label="Image / Video Gallery",
+                reference_label="last",
+                why="matched last user-added video",
+            )
+            if len(instruction) > 0:
+                runtime_lines.append(instruction)
+        if "audio" in new_user_gallery_media:
+            instruction = self.tool_box._runtime_media_instruction(
+                new_user_gallery_media["audio"],
+                action="added",
+                gallery_label="Audio Gallery",
+                reference_label="last",
+                why="matched last user-added audio",
+            )
+            if len(instruction) > 0:
+                runtime_lines.append(instruction)
+
+        runtime_lines.extend(self.tool_box._get_selected_gallery_media_updates())
+
+        if len(runtime_lines) > 0:
+            note_blocks.append(
+                "\n".join(
+                    [
+                        "<wangp_runtime_update>",
+                        "Hidden WanGP runtime state. This is environment metadata, not a user message.",
+                        *runtime_lines,
+                        "</wangp_runtime_update>",
+                    ]
+                )
+            )
+            if self.debug_enabled:
+                self._log(f"Prepared runtime update with {len(runtime_lines)} instruction(s).")
+
+        if _INJECT_SELECTED_MEDIA_RUNTIME_UPDATES:
+            snapshot = self.tool_box._get_selected_runtime_snapshot()
+            previous_snapshot = {}
+            previous_signature = str(self.session.runtime_status_signature or "").strip()
+            if len(previous_signature) > 0:
+                try:
+                    previous_snapshot = dict(json.loads(previous_signature) or {})
+                except Exception:
+                    previous_snapshot = {}
+            if snapshot is None:
+                if len(previous_signature) == 0:
+                    normalized_snapshot = None
+                else:
+                    normalized_snapshot = {key: None for key in _RUNTIME_STATUS_ALL_KEYS}
             else:
-                rendered_value = "none" if value is None else value
-            lines.append(f"{key}: {rendered_value}")
-        lines.append("</wangp_runtime_update>")
-        self.session.runtime_status_note = "\n".join(lines)
-        self.session.runtime_status_signature = signature
-        if self.debug_enabled:
-            self._log(f"Prepared runtime status update: {signature}")
+                normalized_snapshot = {key: None for key in _RUNTIME_STATUS_ALL_KEYS}
+                for key in ("selected_visual_media_id", "selected_visual_media_type", "selected_visual_media_label", "selected_audio_media_id", "selected_audio_media_type", "selected_audio_media_label"):
+                    normalized_snapshot[key] = str(snapshot.get(key, "") or "").strip() or None
+                for key in ("selected_visual_current_time_seconds", "selected_visual_current_frame_no"):
+                    normalized_snapshot[key] = snapshot.get(key, None)
+            if normalized_snapshot is not None:
+                signature = _json_dumps(normalized_snapshot)
+                if signature != self.session.runtime_status_signature:
+                    changed_keys = [key for key in _RUNTIME_STATUS_ALL_KEYS if previous_snapshot.get(key, None) != normalized_snapshot.get(key, None)]
+                    if len(previous_snapshot) == 0:
+                        emitted_keys = list(_RUNTIME_STATUS_ALL_KEYS)
+                    else:
+                        emitted_keys = []
+                        if any(key in changed_keys for key in _RUNTIME_STATUS_VISUAL_KEYS):
+                            emitted_keys.extend(_RUNTIME_STATUS_VISUAL_KEYS)
+                        if any(key in changed_keys for key in _RUNTIME_STATUS_AUDIO_KEYS):
+                            emitted_keys.extend(_RUNTIME_STATUS_AUDIO_KEYS)
+                    if len(emitted_keys) > 0:
+                        lines = [
+                            "<wangp_runtime_update>",
+                            "Hidden WanGP runtime state. This is environment metadata, not a user message.",
+                            "Use it as factual UI context only. Omitted keys keep their previous runtime-update values.",
+                        ]
+                        for key in emitted_keys:
+                            value = normalized_snapshot.get(key, None)
+                            if isinstance(value, str):
+                                rendered_value = value if len(value) > 0 else "none"
+                            else:
+                                rendered_value = "none" if value is None else value
+                            lines.append(f"{key}: {rendered_value}")
+                        lines.append("</wangp_runtime_update>")
+                        note_blocks.append("\n".join(lines))
+                        if self.debug_enabled:
+                            self._log(f"Prepared runtime status update: {signature}")
+                self.session.runtime_status_signature = signature
+        else:
+            self.session.runtime_status_signature = ""
+
+        self.session.runtime_status_note = "\n\n".join(note_blocks)
 
     def _build_pending_user_message(self, user_text: str) -> dict[str, Any]:
         message = {"role": "user", "content": str(user_text or "").strip()}
@@ -3031,6 +4217,19 @@ class AssistantEngine:
             image,
             question,
         )
+        if self.debug_enabled:
+            prompt_embeds_shape = None if prompt_embeds is None else tuple(int(x) for x in prompt_embeds.shape)
+            prompt_position_shape = None if prompt_position_ids is None else tuple(int(x) for x in prompt_position_ids.shape)
+            prompt_embeds_dtype = None if prompt_embeds is None else str(prompt_embeds.dtype).replace("torch.", "")
+            prompt_position_dtype = None if prompt_position_ids is None else str(prompt_position_ids.dtype).replace("torch.", "")
+            self._log(
+                "Inspect visual query "
+                f"media_id={media_record.get('media_id', '')} media_type={media_type} image_size={image.size} "
+                f"question={question!r} prompt_tokens={len(prompt_token_ids)} "
+                f"prompt_embeds_shape={prompt_embeds_shape} prompt_embeds_dtype={prompt_embeds_dtype} "
+                f"prompt_position_ids_shape={prompt_position_shape} prompt_position_ids_dtype={prompt_position_dtype} "
+                f"position_offset={int(position_offset or 0)}"
+            )
         runtime = self._acquire_runtime()
         answer = runtime.generate_embedded_answer(
             prompt_token_ids,

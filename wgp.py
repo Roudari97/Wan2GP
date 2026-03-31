@@ -31,7 +31,6 @@ from pathlib import Path
 from datetime import datetime
 import gradio as gr
 from shared.gradio import gradio_queue_focus_patch
-gradio_queue_focus_patch.install()
 from gradio.themes.utils.sizes import Size
 import random
 import json
@@ -43,9 +42,9 @@ from shared.utils.utils import convert_tensor_to_image, save_image, get_video_in
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_frame_location, get_outpainting_full_area_dimensions
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension
 from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_pair_volumes_to_temp_files, save_video, save_image
-from shared.utils.audio_video import save_image_metadata, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension
-from shared.utils.audio_metadata import save_audio_metadata, read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
-from shared.utils.video_metadata import save_video_metadata
+from shared.utils.audio_video import read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension
+from shared.utils.audio_metadata import read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
+from shared.utils.media_recording import record_file_metadata as shared_record_file_metadata
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import get_attention_modes, get_supported_attention_modes
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers
@@ -115,7 +114,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.6"
-WanGP_version = "11"
+WanGP_version = "11.13"
 settings_version = 2.55
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -1412,11 +1411,7 @@ def _build_runtime_task(task_id_val, params, plugin_data=None):
     }
 
 
-def _process_task_params(params, state, log_prefix="[load]"):
-    """Apply defaults, fix settings, and prepare params for a task.
-
-    Returns (model_type, error_msg or None). Modifies params in place.
-    """
+def _extract_model_type(params, state, log_prefix="[load]"):
     base_model_type = params.get('base_model_type', None)
     model_type = original_model_type = params.get('model_type', base_model_type)
 
@@ -1428,8 +1423,6 @@ def _process_task_params(params, state, log_prefix="[load]"):
     params["model_type"] = model_type
     if get_model_def(model_type) is None:
         return None, f"Unknown model type: {original_model_type}"
-    clean_settings(model_type, params)
-    params['state'] = state
     return model_type, None
 
 
@@ -1448,16 +1441,24 @@ def _parse_task_manifest(manifest, state, media_base_path, cache_dir=None, log_p
         params = task_data.get('params', {})
         task_id_loaded = task_data.get('id', task_id + 1)
 
-        # Process params (merge defaults, fix settings)
-        model_type, error = _process_task_params(params, state, log_prefix)
+        model_type, error = _extract_model_type(params, state, log_prefix)
         if error:
             if first_error is None:
                 first_error = error
             print(f"{log_prefix} {error} for task #{task_id_loaded}. Skipping.")
             continue
 
+        params['state'] = state
+
         if media_base_path is not None or _task_has_path_attachments(params):
             _load_task_attachments(params, media_base_path or os.path.dirname(os.path.abspath(__file__)), cache_dir, log_prefix)
+
+        params, error = validate_task(task_data, state)
+        if error:
+            if first_error is None:
+                first_error = error
+            print(f"{log_prefix} {error} for task #{task_id_loaded}. Skipping.")
+            continue
 
         # Build runtime task
         runtime_task = _build_runtime_task(task_id_loaded, params, task_data.get('plugin_data', {}))
@@ -2448,7 +2449,8 @@ if not Path(config_load_filename).is_file():
         "checkpoints_paths": fl.default_checkpoints_paths,
         "loras_root": DEFAULT_LORA_ROOT,
         "save_queue_if_crash": 1,
-		"queue_color_scheme": "pastel",
+        "queue_color_scheme": "pastel",
+        "process_queues_when_browser_unfocused": 1,
         "model_hierarchy_type": 1,
         "mmaudio_mode": 0,
         "mmaudio_persistence": 1,
@@ -2469,6 +2471,9 @@ else:
     server_config = json.loads(text)
 
 server_config.setdefault("prompt_enhancer_quantization", "quanto_int8")
+server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1)
+gradio_queue_focus_patch.BACKGROUND_SCHEDULER_DEFAULT_ENABLED = bool(server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1))
+gradio_queue_focus_patch.install()
 
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
@@ -4275,6 +4280,10 @@ def resolve_media_creation_date(file_name, configs=None):
     return creation_date
 
 
+def is_deepy_display_metadata(configs):
+    return isinstance(configs, dict) and str(configs.get("model_type", "") or "").strip() == "Deepy"
+
+
 def update_video_prompt_type(state, any_video_guide = False, any_video_mask = False, any_background_image_ref = False, process_type = None, default_update = ""):
     letters = default_update
     settings = get_current_model_settings(state)
@@ -4403,7 +4412,31 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
                 pp_labels += [ "MMAudio" ]
 
 
-        if configs == None or not "seed" in configs:
+        if is_deepy_display_metadata(configs):
+            values += ["Deepy"]
+            labels += ["Made By"]
+            video_prompt = html.escape(str(configs.get("prompt", "") or "")[:1024]).replace("\n", "<BR>")
+            if len(video_prompt) > 0:
+                values += [video_prompt]
+                labels += ["Prompt"]
+            video_creation_date = "Deleted" if is_deleted else resolve_media_creation_date(file_name, configs)
+            if is_image:
+                values += [f"{width}x{height}"]
+                labels += ["Resolution"]
+            elif is_video:
+                values += [f"{width}x{height}", f"{frames_count} frames (duration={frames_count/fps:.1f} s, fps={round(fps)})"]
+                labels += ["Resolution", "Frames"]
+            else:
+                duration_seconds = configs.get("duration_seconds", None)
+                if duration_seconds is not None:
+                    values += [f"{duration_seconds}s"]
+                    labels += ["Duration"]
+            if nb_audio_tracks > 0:
+                values += [nb_audio_tracks]
+                labels += ["Nb Audio Tracks"]
+            values += [video_creation_date]
+            labels += ["Creation Date"]
+        elif configs == None or not "seed" in configs:
             values += misc_values
             labels += misc_labels
             
@@ -5885,49 +5918,7 @@ def get_output_filepath(file_path, is_image, audio_only):
     return get_available_filename(base_path, file_path)
 
 def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=None, replace_last_file=False):
-    metadata_choice = server_config.get("metadata_type","metadata")
-    file_list, file_settings_list, audio_file_list, audio_file_settings_list = get_processed_queue(gen)
-    video_path = [video_path] if not isinstance(video_path, list) else video_path
-    for no, path in enumerate(video_path):
-        previous_path = None
-        saved_configs = configs if no > 0 or configs is None else configs.copy()
-        if configs is not None:
-            if metadata_choice == "json":
-                json_path = os.path.splitext(path)[0] + ".json"
-                with open(json_path, 'w') as f:
-                    json.dump(configs, f, indent=4)
-            elif metadata_choice == "metadata":
-                if audio_only:
-                    save_audio_metadata(path, configs)
-                if is_image:
-                    save_image_metadata(path, configs)
-                else:
-                    save_video_metadata(path, configs, embedded_images)
-        if verbose_level > 0:
-            if audio_only:
-                print(f"New audio file saved to Path: "+ path)
-            elif is_image:
-                print(f"New image saved to Path: "+ path)
-            else:
-                print(f"New video saved to Path: "+ path)
-        with lock:
-            if audio_only:
-                audio_file_list.append(path)
-                audio_file_settings_list.append(saved_configs)
-            else:
-                if replace_last_file and not is_image and no == 0 and len(file_list) > 0:
-                    previous_path = file_list[-1]
-                    file_list[-1] = path
-                    file_settings_list[-1] = saved_configs
-                else:
-                    file_list.append(path)
-                    file_settings_list.append(saved_configs)
-            gen["last_was_audio"] = audio_only
-        if previous_path is not None and previous_path != path:
-            if metadata_choice == "json":
-                previous_json_path = os.path.splitext(previous_path)[0] + ".json"
-                if os.path.isfile(previous_json_path): os.remove(previous_json_path)
-            if os.path.isfile(previous_path): os.remove(previous_path)
+    return shared_record_file_metadata(video_path, configs, is_image, audio_only, gen, get_processed_queue=get_processed_queue, metadata_choice=server_config.get("metadata_type", "metadata"), embedded_images=embedded_images, replace_last_file=replace_last_file, lock=lock, verbose_level=verbose_level)
 
 
 def generate_video(
@@ -6041,8 +6032,6 @@ def generate_video(
     plugin_data=None,
 ):
 
-
-
     def remove_temp_filenames(temp_filenames_list):
         for temp_filename in temp_filenames_list: 
             if temp_filename!= None and os.path.isfile(temp_filename):
@@ -6094,7 +6083,7 @@ def generate_video(
     
     base_model_type = get_base_model_type(model_type)
     model_handler = get_model_handler(base_model_type)
-    block_size = model_handler.get_vae_block_size(base_model_type) if hasattr(model_handler, "get_vae_block_size") else 16
+    block_size = model_def.get("vae_block_size", 16)
 
     if "P" in preload_model_policy and not "U" in preload_model_policy:
         while wan_model == None:
@@ -7388,13 +7377,16 @@ def process_tasks(state):
                 
                 try:
                     import inspect
-                    validated_params, validation_error = validate_task(task, state)
-                    if validated_params is None:
-                        send_cmd("error", validation_error or "Task failed validation.")
-                        return
-                    expected_args = set(inspect.signature(generate_video).parameters.keys())
-                    filtered_params = {k: v for k, v in validated_params.items() if k in expected_args}
-                    filtered_params.setdefault("client_id", "")
+                    model_type = params.get('model_type')
+                    if model_type:
+                        default_settings = get_default_settings(model_type)
+                        expected_args = set(inspect.signature(generate_video).parameters.keys())
+                        for arg_name in expected_args:
+                            if arg_name not in params and arg_name in default_settings:
+                                params[arg_name] = default_settings[arg_name]
+                    else:
+                        expected_args = set(inspect.signature(generate_video).parameters.keys())                    
+                    filtered_params = {k: v for k, v in params.items() if k in expected_args}
                     plugin_data = task.pop('plugin_data', {})
                     success = generate_video(task, send_cmd, plugin_data=plugin_data,  **filtered_params)
                     
@@ -8519,7 +8511,8 @@ def eject_audio_from_gallery(state, input_file_list, choice):
 def add_videos_to_gallery(state, input_file_list, choice, audio_files_paths, audio_file_selected, files_to_load):
     gen = get_gen_info(state)
     if files_to_load == None:
-        return [gr.update()]*7
+        gr.Info("Please Select a File To Import")
+        return [gr.update()]*9
     new_audio= False
     new_video= False
 
@@ -8558,7 +8551,8 @@ def add_videos_to_gallery(state, input_file_list, choice, audio_files_paths, aud
             valid_files_count +=1
 
     if valid_files_count== 0 and invalid_files_count ==0:
-        gr.Info("No Video to Add")
+        gr.Info("No Valid Media to Import")
+        return [gr.update()] * 9
     else:
         txt = ""
         if valid_files_count > 0:
@@ -8636,6 +8630,8 @@ def use_video_settings(state, input_file_list, choice, source):
         file_name= file_list[choice]
         if configs == None:
             gr.Info("No Settings to Extract")
+        elif is_deepy_display_metadata(configs):
+            gr.Info("Deepy helper metadata is display-only and cannot be loaded as WanGP settings")
         else:
             current_model_type = get_state_model_type(state)
             model_type = configs["model_type"] 
@@ -8744,6 +8740,8 @@ def get_settings_from_file(state, file_path, allow_json, merge_with_defaults, sw
     except:
         configs = None
     if configs is None: return None, False, False
+    if is_deepy_display_metadata(configs):
+        return configs, any_image_or_video, any_audio
         
 
     current_model_type = get_state_model_type(state)
@@ -8837,6 +8835,9 @@ def load_settings_from_file(state, file_path):
     configs, any_video_or_image_file, any_audio = get_settings_from_file(state, file_path, True, True, True)
     if configs == None:
         gr.Info("File not supported")
+        return gr.update(), gr.update(), gr.update(), gr.update(), None
+    if is_deepy_display_metadata(configs):
+        gr.Info("Deepy helper metadata is display-only and cannot be loaded as WanGP settings")
         return gr.update(), gr.update(), gr.update(), gr.update(), None
 
     current_model_type = get_state_model_type(state)
@@ -11005,9 +11006,13 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         lora_url = gr.Text(label ="Lora URL", placeholder= "Enter Lora URL", scale=4, show_label=False, elem_classes="compact_text" )
                         download_lora_btn = gr.Button("Download Lora", scale=1, min_width=10)
 
-                assistant_ui = deepy_gradio_ui.build_deepy_chat_ui(deepy_visible=_deepy.is_available())
-                assistant_launcher_host = assistant_ui.launcher_host
-                assistant_panel = assistant_ui.panel
+                assistant_ui = None
+                assistant_launcher_host = None
+                assistant_panel = None
+                if tab_id == 'generate':
+                    assistant_ui = deepy_gradio_ui.build_deepy_chat_ui(deepy_visible=_deepy.is_available())
+                    assistant_launcher_host = assistant_ui.launcher_host
+                    assistant_panel = assistant_ui.panel
 
             mode = gr.Text(value="", visible = False)
 
@@ -11015,19 +11020,20 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
             if not update_form:
                 state = default_state if default_state is not None else gr.State(state_dict)
                 gen_status = gr.Text(interactive= False, label = "Status")
-                status_trigger = gr.Text(interactive= False, visible=False)
-                load_queue_trigger = gr.Text(interactive= False, visible=False)
-                abort_client_id= gr.Text(interactive= False, visible=False)
+                main_bridge_elem_ids = tab_id == 'generate'
+                status_trigger = gr.Text(interactive= False, visible=False, elem_id="wangp_main_status_trigger" if main_bridge_elem_ids else None)
+                load_queue_trigger = gr.Text(interactive= False, visible=False, elem_id="wangp_main_load_queue_trigger" if main_bridge_elem_ids else None)
+                abort_client_id= gr.Text(interactive= False, visible=False, elem_id="wangp_main_abort_client_id" if main_bridge_elem_ids else None)
                 default_files = []
                 current_gallery_tab = gr.Number(0, visible=False)
                 with gr.Tabs() as gallery_tabs:
-                    with gr.Tab("Video / Images", id="video_images"):
+                    with gr.Tab("Video / Images Gallery", id="video_images"):
                         output = gr.Gallery(value =default_files, label="Generated videos", preview= True, show_label=False, elem_id="gallery" , columns=[3], rows=[1], object_fit="contain", height=450, selected_index=0, interactive= False)
-                    with gr.Tab("Audio Files", id="audio"):
+                    with gr.Tab("Audio Files Gallery", id="audio"):
                         output_audio = AudioGallery(audio_paths=[], max_thumbnails=999, height=40, update_only=update_form)
                         audio_files_paths, audio_file_selected, audio_gallery_refresh_trigger = output_audio.get_state()
-                output_trigger = gr.Text(interactive= False, visible=False)
-                selected_video_time_input = gr.Text(interactive= False, visible=False, elem_id="selected_video_time_input")
+                output_trigger = gr.Text(interactive= False, visible=False, elem_id="wangp_main_output_trigger" if main_bridge_elem_ids else None)
+                selected_video_time_input = gr.Text(interactive= False, visible=False, elem_id="selected_video_time_input" if main_bridge_elem_ids else None)
                 refresh_models_trigger = gr.Text(interactive= False, visible=False)
                 refresh_form_trigger = gr.Text(interactive= False, visible=False)
                 fill_wizard_prompt_trigger = gr.Text(interactive= False, visible=False)
@@ -11036,7 +11042,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 model_choice_target = gr.Text(interactive= False, visible=False)
 
 
-            with gr.Accordion("Video Info and Late Post Processing & Audio Remuxing", open=False) as video_info_accordion:
+            with gr.Accordion("Media Info / Late Post Processing / Import Media", open=False) as video_info_accordion:
                 with gr.Tabs() as video_info_tabs:
                     default_visibility_false = {} if update_form else {"visible" : False}                        
                     default_visibility_true = {} if update_form else {"visible" : True}                        
@@ -11093,10 +11099,10 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         with gr.Row():
                             video_info_remux_audio_btn = gr.Button("Remux Audio", size ="sm", visible=True)
                             video_info_eject_video3_btn = gr.Button("Eject Video", size ="sm", visible=True)
-                    with gr.Tab("Add Videos / Images / Audio Files", id= "video_add"):
-                        files_to_load = gr.Files(label= "Files to Load in Gallery", height=120)
+                    with gr.Tab("Import Media to Galleries", id= "video_add"):
+                        files_to_load = gr.Files(label= "Media to Import in Galleries", height=120)
                         with gr.Row():
-                            video_info_add_videos_btn = gr.Button("Add Videos / Images / Audio Files", size ="sm")
+                            video_info_add_videos_btn = gr.Button("Import Videos / Images / Audio Files", size ="sm")
  
             if not update_form:
                 generate_btn = gr.Button("Generate")
@@ -11306,27 +11312,34 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 )
             
             set_save_form_event(save_form_trigger.change)
-            deepy_gradio_ui.bind_deepy_chat_ui(
-                assistant_ui,
-                state=state,
-                output=output,
-                last_choice=last_choice,
-                audio_files_paths=audio_files_paths,
-                audio_file_selected=audio_file_selected,
-                selected_video_time_input=selected_video_time_input,
-                load_queue_trigger=load_queue_trigger,
-                output_trigger=output_trigger,
-                abort_client_id=abort_client_id,
-                handlers=deepy_gradio_ui.DeepyChatHandlers(
-                    prepare_request_context=init_generate,
-                    update_tool_ui_settings=_deepy.update_tool_ui_settings,
-                    persist_auto_cancel_queue_tasks=_deepy.persist_auto_cancel_queue_tasks,
-                    store_selected_video_time=_deepy.store_selected_video_time,
-                    ask_ai=_deepy.ask_ai,
-                    stop_ai=_deepy.stop_ai,
-                    reset_ai=_deepy.reset_ai,
-                ),
-            )
+            if assistant_ui is not None:
+                deepy_gradio_ui.bind_deepy_chat_ui(
+                    assistant_ui,
+                    state=state,
+                    output=output,
+                    last_choice=last_choice,
+                    audio_files_paths=audio_files_paths,
+                    audio_file_selected=audio_file_selected,
+                    selected_video_time_input=selected_video_time_input,
+                    load_queue_trigger=load_queue_trigger,
+                    output_trigger=output_trigger,
+                    abort_client_id=abort_client_id,
+                    handlers=deepy_gradio_ui.DeepyChatHandlers(
+                        prepare_request_context=init_generate,
+                        update_tool_ui_settings=_deepy.update_tool_ui_settings,
+                        store_selected_video_time=_deepy.store_selected_video_time,
+                        ask_ai=_deepy.ask_ai,
+                        stop_ai=_deepy.stop_ai,
+                        reset_ai=_deepy.reset_ai,
+                    ),
+                )
+                main.load(
+                    fn=_deepy.browser_session_started,
+                    inputs=[state],
+                    outputs=[assistant_ui.chat_event, load_queue_trigger, assistant_ui.request, abort_client_id],
+                    queue=False,
+                    show_progress="hidden",
+                )
             gr.on(triggers=[video_info_eject_video_btn.click, video_info_eject_video2_btn.click, video_info_eject_video3_btn.click, video_info_eject_deleted_video_btn.click,  video_info_eject_image_btn.click], fn=eject_video_from_gallery, inputs =[state, output, last_choice], outputs = [output, video_info, video_buttons_row] )
             video_info_to_control_video_btn.click(fn=video_to_control_video, inputs =[state, output, last_choice], outputs = [video_guide] )            
             video_info_to_video_source_btn.click(fn=video_to_source_video, inputs =[state, output, last_choice], outputs = [video_source] )
@@ -11804,6 +11817,7 @@ def create_ui():
         target_edit_state = gr.Text(value = "edit_state", interactive= False, visible= False)
         edit_queue_trigger = gr.Text(value='', interactive= False, visible=False)
         with gr.Tabs(selected="video_gen", ) as main_tabs:
+            # JS keepalive patch targets the stable Gradio tab id "video_gen"; the label can change, but if this id changes the patch must be updated too.
             with gr.Tab("Video Generator", id="video_gen") as video_generator_tab:
                 with gr.Row():
                     if args.lock_model:    
