@@ -15,6 +15,7 @@ _ARCH_SPECS = {
         "spatial_upscaler": "ltx-2-spatial-upscaler-x2-1.0.safetensors",
         "temporal_upscaler": "ltx-2-temporal-upscaler-x2-1.0.safetensors",
         "distilled_lora": "ltx-2-19b-distilled-lora-384.safetensors",
+        "union_control_lora": "ltx-2-19b-ic-lora-union-control-ref0.5.safetensors",
         "id_lora": "id-lora-celebvhq-ltx2.safetensors",
         "video_vae": "ltx-2-19b_vae.safetensors",
         "audio_vae": "ltx-2-19b_audio_vae.safetensors",
@@ -185,15 +186,32 @@ class family_handler:
             "no_background_removal": True,
             "vae_block_size": 64,
         }
+        
+        if distilled and base_model_type in ["ltx2_22B"]:
+            extra_model_def["video_guide_outpainting"] = [0,1]
+            extra_model_def["video_guide_outpainting_label"] = "Enable Spatial Outpainting on Control Video using Ic Lora Outpaint"
+            extra_model_def["guide_inpaint_color"] = 0
+
         preset_profiles_dir = spec.get("preset_profiles_dir")
         if preset_profiles_dir and not distilled:
             extra_model_def["preset_profiles_dir"] = [preset_profiles_dir]
         extra_model_def["extra_control_frames"] = 1
         extra_model_def["dont_cat_preguide"] = True
-        extra_model_def["input_video_strength"] = "Image / Source Video Strength (you may try values lower value than 1 to get more motion)"
+        extra_model_def["input_video_strength"] = {
+            "label": "Start Image / Source Strength (lower values may create more motion)",
+            "name": "Start Image / Source Strength",
+        }
+        extra_model_def["denoising_strength"] = {
+            "label": "Control Video Strength (higher = closer to the Control Video)",
+            "name": "Control Video Strength",
+        }
+        extra_model_def["masking_strength"] = {
+            "label": "Masked Control Duration (higher = longer masked reinjection)",
+            "name": "Masked Control Duration",
+        }
         
         control_choices = [("No Video Process", "")]
-        control_choices += [ ("Transfer Human Motion", "PVG") , ("Transfer Depth", "DVG") , ("Transfer Canny Edges", "EVG"), ("Use LTX-2 raw format Control Video", "VG")] if distilled else []
+        control_choices += [ ("Transfer Human Motion", "PVG") , ("Transfer Depth", "DVG") , ("Transfer Canny Edges", "EVG"), ("LTX2 Raw Format / Control Video for Ic Lora", "VG")] if distilled else []
         control_choices +=   [("Inject Frames", "KFI")]
         extra_model_def["guide_custom_choices"] = {
             "choices": control_choices,
@@ -221,7 +239,8 @@ class family_handler:
             extra_model_def.update(
                 {
                     "lock_inference_steps": True,
-                    "no_negative_prompt": True,
+                    "NAG": True,
+                    "no_negative_prompt": False,
                 }
             )
         else:
@@ -355,7 +374,20 @@ class family_handler:
                     inputs["perturbation_switch"] = 0
             elif sample_solver not in {"", "euler"}:
                 return f"Sampler '{sample_solver}' is not supported for {base_model_type}."
+        video_guide_outpainting = str(inputs.get("video_guide_outpainting") or "")
+        video_prompt_type = inputs.get("video_prompt_type") or ""
         audio_prompt_type = inputs.get("audio_prompt_type") or ""
+        if pipeline_kind == "distilled" and len(video_guide_outpainting) > 0 and not video_guide_outpainting.startswith("#") and video_guide_outpainting != "0 0 0 0":
+            if "V" in video_prompt_type :
+                if any(letter in video_prompt_type for letter in "PDE"):
+                    return "LTX2 outpainting on Control Video supports only LTX2 Raw Format  / Contro Video for Ic Lora."
+                if "1" in audio_prompt_type:
+                    return "LTX2 outpainting on Control Video is not compatible with the ID-LoRA option."
+                if "F" in video_prompt_type :
+                    return "LTX2 outpainting is not yet compatible with Inject Frames."
+                if "A" in video_prompt_type :
+                    return "LTX2 outpainting doesnt support Video Mask."
+
         if "A" in audio_prompt_type and inputs.get("audio_guide") is None:
             audio_source = inputs.get("audio_source")
             if audio_source is not None:
